@@ -44,6 +44,33 @@ SEARCH_TOKEN_SCOPE = os.environ.get(
 # Fields needed to build the document-centric result set. ``parent_id`` is the
 # dedup key: one source document is chunked into many rows that share a
 # parent_id, and we collapse those back down to a single document per parent.
+#
+# TODO [ISSUE-4 CRITICAL]: DocumentUrl is hardcoded as "#" — all document links in the UI are broken.
+# The SharePoint webUrl must be stored as blob metadata during ingest and mapped through the index.
+#
+# Fix — 3 steps:
+#
+# Step 1 (ingest/function_app.py): capture the SharePoint item's webUrl as blob metadata:
+#   metadata["SourceUrl"] = _to_blob_metadata_value(item.get("webUrl", ""))
+#
+# Step 2 (infra/search-index.json): add a new field to the index:
+#   { "name": "SourceUrl", "type": "Edm.String", "searchable": false, "retrievable": true }
+#
+# Step 3 (infra/search-indexer.json): add a field mapping from blob metadata to the index field:
+#   { "sourceFieldName": "metadata_SourceUrl", "targetFieldName": "SourceUrl" }
+#
+# Then add "SourceUrl" here so it is returned in results:
+#   SELECT_FIELDS = ["title", "Prefix", "ContentType", "parent_id", "SourceUrl"]
+#
+# And in _collapse_to_documents replace the stub:
+#   "DocumentUrl": result.get("SourceUrl") or "#",
+#
+# To test: upload a single file to Blob Storage with metadata["SourceUrl"] set,
+# re-run the indexer, then call GET /query and assert DocumentUrl != "#".
+#
+# TODO [ISSUE-11 MEDIUM]: "content" (raw chunk text) is not included in SELECT_FIELDS.
+# Not needed for display (captions cover it) but useful for downstream integrations.
+# Add "content" to SELECT_FIELDS if consumers need the raw text.
 SELECT_FIELDS = ["title", "Prefix", "ContentType", "parent_id"]
 
 # Vector field on the index that the azureOpenAI vectorizer populates.
@@ -130,6 +157,20 @@ def run_search(
         fields=VECTOR_FIELD,
     )
 
+    # TODO [ISSUE-12 MEDIUM]: No pagination — top=100 chunks, all returned in one response.
+    # For large corpora this causes slow responses and the UI renders everything at once.
+    # Fix — add skip/top parameters to run_search and the /query endpoint model:
+    #
+    #   def run_search(query, keywords=None, filters=None, page: int = 0, page_size: int = 10):
+    #       ...
+    #       results = get_client().search(..., top=page_size, skip=page * page_size)
+    #
+    # Add to QueryRequest model (models.py):
+    #   page: int = 0
+    #   page_size: int = 10
+    #
+    # To test: call POST /query with {"query": "test", "page": 0, "page_size": 3} and
+    # assert the response contains at most 3 results.
     results = get_client().search(
         search_text=search_text,
         vector_queries=[vector_query],

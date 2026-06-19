@@ -108,6 +108,23 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
 }
 
 // ─── Azure AI Search ────────────────────────────────────────────────────────
+// TODO [ISSUE-10 MEDIUM]: Basic SKU has no replica support (no SLA) and a 16-index limit.
+// For production use, upgrade to Standard S1:
+//   - 50 indexes, up to 3 replicas (99.9% SLA with 2+ replicas), partition scaling
+//   - Cost: ~$250/month vs ~$75/month for Basic
+//
+// Fix — change the sku and add a second replica for SLA:
+//   sku: { name: 'standard' }
+//   properties: {
+//     replicaCount: 2   // 99.9% SLA requires >= 2 replicas
+//     partitionCount: 1
+//     hostingMode: 'default'
+//     semanticSearch: 'standard'  // 'free' tier becomes 'standard' on S1
+//   }
+//
+// To test the upgrade: deploy with standard SKU to a dev resource group, run
+// scripts/create-indexer.py, and verify the index is created and queryable.
+// Check Azure Portal > Search service > Scale to confirm replica count.
 resource searchService 'Microsoft.Search/searchServices@2023-11-01' = {
   name: '${prefix}-search-${unique}'
   location: location

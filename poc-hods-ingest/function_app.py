@@ -360,8 +360,15 @@ def _upload_changed_files(
 
     return uploaded
 
+# TODO [ISSUE-1 CRITICAL]: Timer fires every minute — will hit Graph API throttling (HTTP 429) on day 1.
+# Current:  "0 */1 * * * *"  → every minute
+# Fix:      "0 0 * * * *"    → top of every hour  (recommended for production)
+#           "0 0 2 * * *"    → daily at 02:00 UTC (if volume is low)
+# To test the fix locally, change the schedule below and run:
+#   func start
+# Verify in the Azure Functions host log that the next run shows the correct interval.
 @app.timer_trigger(schedule="0 */1 * * * *", arg_name="myTimer", run_on_startup=False,
-              use_monitor=False) 
+              use_monitor=False)
 def Ingest(myTimer: func.TimerRequest) -> None:
     
     if myTimer.past_due:
@@ -394,6 +401,29 @@ def Ingest(myTimer: func.TimerRequest) -> None:
         logging.error("Missing SharePoint app settings: %s", ", ".join(missing))
         return
 
+    # TODO [ISSUE-7 HIGH]: Uses a connection string (stored secret) instead of Managed Identity.
+    # The Function App already has a System-Assigned Managed Identity (assigned in main.bicep)
+    # and the Storage Blob Data Contributor role can be granted via Bicep.
+    #
+    # Fix — replace with:
+    #   from azure.identity import DefaultAzureCredential
+    #   storage_account_url = os.getenv("BLOB_STORAGE_ACCOUNT_URL")  # e.g. https://<account>.blob.core.windows.net
+    #   blob_service_client = BlobServiceClient(storage_account_url, DefaultAzureCredential())
+    #
+    # In Bicep, add a Storage Blob Data Contributor role assignment:
+    #   resource fnStorageRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+    #     name: guid(storageAccount.id, functionApp.id, 'blob-contributor')
+    #     scope: storageAccount
+    #     properties: {
+    #       roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+    #       principalId: functionApp.identity.principalId
+    #       principalType: 'ServicePrincipal'
+    #     }
+    #   }
+    #
+    # To test: remove BLOB_STORAGE_CONNECTION_STRING from local.settings.json, set
+    # BLOB_STORAGE_ACCOUNT_URL, run `az login`, then `func start` — blobs should
+    # upload using your local identity.
     blob_service_client = BlobServiceClient.from_connection_string(blob_connection_string)
 
     # Read last-sync value from blob storage
@@ -421,6 +451,12 @@ def Ingest(myTimer: func.TimerRequest) -> None:
         site_id = _resolve_site_id(site_hostname, site_path, headers, site_id_override)
         drive_id = _get_drive_id(site_id, drive_name, headers)
 
+        # TODO [ISSUE-2 CRITICAL]: max_files=5 means a 500-doc library needs 100 runs to fully index.
+        # At daily schedule that is ~3 months. Remove the cap or make it env-configurable.
+        # Fix — replace the hardcoded 5 with:
+        #   max_files = int(os.getenv("INGEST_MAX_FILES_PER_RUN", "500"))
+        # To test: set INGEST_MAX_FILES_PER_RUN=10 in local.settings.json and verify
+        # the function processes more than 5 files in a single run.
         uploaded_count = _upload_changed_files(
             blob_service_client=blob_service_client,
             container_name=container_name,
@@ -435,6 +471,30 @@ def Ingest(myTimer: func.TimerRequest) -> None:
         logging.exception("Failed to sync SharePoint files: %s", exc)
         return
     
+    # TODO [ISSUE-3 CRITICAL]: last-sync always advances to now_utc even if some files failed.
+    # If file #3 of 5 throws (e.g. Graph 403), items 4-5 are skipped and never retried
+    # because the next run starts from now_utc, not from the last successfully synced file.
+    #
+    # Fix — track the earliest modified_at of successfully uploaded files and only advance
+    # last-sync to that value:
+    #
+    #   # In _upload_changed_files, return the earliest successfully-uploaded modified_at:
+    #   def _upload_changed_files(...) -> tuple[int, datetime.datetime | None]:
+    #       earliest_success: datetime.datetime | None = None
+    #       ...
+    #       blob_client.upload_blob(...)
+    #       uploaded += 1
+    #       if earliest_success is None or modified_at < earliest_success:
+    #           earliest_success = modified_at
+    #       ...
+    #       return uploaded, earliest_success
+    #
+    #   uploaded_count, earliest_success = _upload_changed_files(...)
+    #   last_sync_time = (earliest_success or now_utc).isoformat()
+    #
+    # To test: mock _upload_changed_files to raise on the 3rd file; assert last-sync
+    # blob contains the modified_at of file #2, not now_utc.
+    #
     # Update last-sync value in blob storage
     try:
         last_sync_time = now_utc.isoformat()

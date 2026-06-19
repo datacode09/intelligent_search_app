@@ -25,7 +25,38 @@ JWKS_URL  = f"https://login.microsoftonline.com/{TENANT_ID}/discovery/v2.0/keys"
 
 _bearer = HTTPBearer()
 
-# Simple in-process JWKS cache — keys rotate rarely.
+# TODO [ISSUE-6 HIGH]: JWKS cache never expires — when Microsoft rotates signing keys,
+# all tokens signed with the new key will fail with "signing key not found" until
+# the process restarts. Add a TTL so the cache refreshes automatically.
+#
+# Fix — replace the cache with a TTL-aware version:
+#
+#   import time
+#   _JWKS_TTL_SECONDS = 86400  # 24 hours
+#   _jwks_cache: dict | None = None
+#   _jwks_fetched_at: float = 0.0
+#
+#   def _get_jwks() -> dict:
+#       global _jwks_cache, _jwks_fetched_at
+#       if _jwks_cache is None or (time.monotonic() - _jwks_fetched_at) > _JWKS_TTL_SECONDS:
+#           resp = requests.get(JWKS_URL, timeout=10)
+#           resp.raise_for_status()
+#           _jwks_cache = resp.json()
+#           _jwks_fetched_at = time.monotonic()
+#       return _jwks_cache
+#
+# Also add a re-fetch on kid-not-found (one retry, then 401):
+#   key = next((k for k in jwks["keys"] if k["kid"] == header.get("kid")), None)
+#   if key is None:
+#       _jwks_cache = None           # force re-fetch on next request
+#       jwks = _get_jwks()
+#       key = next((k for k in jwks["keys"] if k["kid"] == header.get("kid")), None)
+#   if key is None:
+#       raise _credentials_error("Token signing key not found.")
+#
+# To test: mock requests.get to return different key sets and assert that a second
+# call within TTL does NOT call requests.get again (cache hit), but a call after
+# TTL expiry does (cache miss).
 _jwks_cache: dict | None = None
 
 

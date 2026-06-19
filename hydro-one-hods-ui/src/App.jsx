@@ -29,7 +29,30 @@ function renderHighlighted(text, keyPrefix) {
   return parts
 }
 
-// Dropdown options for the Content Type filter.
+// TODO [ISSUE-8 MEDIUM]: Content Type options are hardcoded and contain duplicates
+// ('Corporate Standards', 'Safety Equipment and Practices', 'Metering DX Single Phase' appear twice).
+// These should be fetched from the AI Search index facets so they stay in sync with the data.
+//
+// Fix — replace hardcoded list with a facet fetch on mount:
+//
+//   const [contentTypeOptions, setContentTypeOptions] = useState([])
+//
+//   useEffect(() => {
+//     fetch(`${API_BASE_URL}/facets`)           // add a GET /facets endpoint to the API
+//       .then(res => res.json())
+//       .then(data => setContentTypeOptions(data.ContentType ?? []))
+//       .catch(() => setContentTypeOptions(CONTENT_TYPE_OPTIONS_FALLBACK))
+//   }, [])
+//
+// In the API (search_index.py), add a /facets endpoint that calls:
+//   client.search("*", facets=["ContentType,count:50"], top=0)
+//   return { "ContentType": [f["value"] for f in results.get_facets()["ContentType"]] }
+//
+// To test: add a new ContentType value to a document in SharePoint, re-run the indexer,
+// then reload the UI and assert the new value appears in the dropdown without a code change.
+//
+// Short-term fix (removes duplicates from current hardcoded list):
+//   const CONTENT_TYPE_OPTIONS = [...new Set([...])]
 const CONTENT_TYPE_OPTIONS = [
   'General',
   'Corporate Standards',
@@ -39,19 +62,16 @@ const CONTENT_TYPE_OPTIONS = [
   'Pesticide',
   'General,Helicopters',
   'Stringing',
-  'Metering DX Single Phase', 
+  'Metering DX Single Phase',
   'Metering DX Three Phase',
   'DS Equipment',
   'Grounding and Bonding',
   'Safety Equipment and Practices',
   'Emergency Response Plans ERPs',
   'HSEMS Control Registry',
-  'Safety Equipment and Practices',
   'Corporate Security',
-  'Corporate Governance', 
-  'Corporate Standards', 
+  'Corporate Governance',
   'Information Security and Disaster Recovery',
-  'Metering DX Single Phase',
   'Protection and Control',
   'Transformers',
 ]
@@ -62,6 +82,49 @@ const PREFIX_OPTIONS = ['AL', 'BU', 'FP', 'HO', 'PR', 'SP']
 // Base URL for the downstream HODS API. Empty string keeps requests on the
 // same origin so the Vite dev-server proxy can forward them to the backend.
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || ''
+
+// TODO [ISSUE-5 CRITICAL]: The API requires a Bearer token but the UI never acquires one.
+// All requests to /OptimizeHybridQueries and /query will return HTTP 401 in production.
+//
+// Fix — add MSAL authentication. Install dependencies first:
+//   npm install @azure/msal-browser @azure/msal-react
+//
+// 1. Create src/authConfig.js:
+//   export const msalConfig = {
+//     auth: {
+//       clientId: import.meta.env.VITE_CLIENT_ID,         // Entra app registration client ID
+//       authority: `https://login.microsoftonline.com/${import.meta.env.VITE_TENANT_ID}`,
+//       redirectUri: window.location.origin,
+//     },
+//   }
+//   export const loginRequest = { scopes: [`api://${import.meta.env.VITE_CLIENT_ID}/user_impersonation`] }
+//
+// 2. Wrap <App /> in src/main.jsx with MsalProvider:
+//   import { MsalProvider } from '@azure/msal-react'
+//   import { PublicClientApplication } from '@azure/msal-browser'
+//   import { msalConfig } from './authConfig'
+//   const msalInstance = new PublicClientApplication(msalConfig)
+//   <MsalProvider instance={msalInstance}><App /></MsalProvider>
+//
+// 3. In App.jsx, acquire token before each API call:
+//   import { useMsal } from '@azure/msal-react'
+//   import { loginRequest } from './authConfig'
+//   const { instance, accounts } = useMsal()
+//
+//   const getToken = async () => {
+//     const response = await instance.acquireTokenSilent({ ...loginRequest, account: accounts[0] })
+//     return response.accessToken
+//   }
+//
+//   // Then in runSearch and the optimizer fetch:
+//   const token = await getToken()
+//   fetch(`${API_BASE_URL}/query`, {
+//     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+//     ...
+//   })
+//
+// To test: open the browser network tab after adding MSAL; confirm the Authorization header
+// is present on every request to /query and /OptimizeHybridQueries.
 
 // A dropdown that lets the user check multiple options. Shows "All" when none
 // are selected, otherwise a count. Closes when clicking outside.
@@ -213,6 +276,13 @@ function App() {
           // Ignore aborts (superseded or timed-out) and stale errors.
           if (err.name === 'AbortError') return
           if (requestId !== requestIdRef.current) return
+          // TODO [ISSUE-9 MEDIUM]: Optimizer failure sets the same error state as a search failure.
+          // The user sees a red error banner with no indication they can still search.
+          // Fix — use a separate state for optimizer errors and degrade gracefully:
+          //   setOptimizeError(err.message)  // show a soft warning, not a blocking error
+          //   // Don't call setError() here — let the user search with the original term
+          // To test: mock /OptimizeHybridQueries to return 502, type a query, and assert
+          // the search input is still usable and the Search button is not disabled.
           setError(err.message)
         })
         .finally(() => {
