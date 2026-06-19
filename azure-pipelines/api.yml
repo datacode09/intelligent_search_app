@@ -1,0 +1,131 @@
+## azure-pipelines/api.yml
+## Lints, tests, and deploys the FastAPI backend (hydro-one-hods-api).
+## Trigger: any change under hydro-one-hods-api/ merged to main.
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [hydro-one-hods-api/**]
+
+pr:
+  branches:
+    include: [main]
+  paths:
+    include: [hydro-one-hods-api/**]
+
+variables:
+  serviceConnection: hods-azure-service-connection
+  apiAppName: $(API_APP_NAME)            # Set in Azure DevOps → Pipelines → Variables
+  pythonVersion: '3.12'
+  workingDir: hydro-one-hods-api
+
+stages:
+
+# ── Stage 1: CI ───────────────────────────────────────────────────────────
+- stage: CI
+  displayName: Lint and Test
+  jobs:
+  - job: Test
+    displayName: Ruff lint + pytest
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+
+    - task: UsePythonVersion@0
+      displayName: Set up Python $(pythonVersion)
+      inputs:
+        versionSpec: $(pythonVersion)
+
+    - script: pip install -r requirements.txt ruff pytest pytest-cov
+      displayName: Install dependencies
+      workingDirectory: $(workingDir)
+
+    - script: ruff check . --output-format=junit --output-file=$(Agent.TempDirectory)/ruff-results.xml
+      displayName: Lint (ruff)
+      workingDirectory: $(workingDir)
+      continueOnError: false
+
+    - script: ruff format --check .
+      displayName: Format check
+      workingDirectory: $(workingDir)
+
+    - script: |
+        pytest tests/ -v \
+          --cov=app \
+          --cov-report=term-missing \
+          --cov-report=xml:$(Agent.TempDirectory)/coverage.xml \
+          --junitxml=$(Agent.TempDirectory)/test-results.xml \
+          --cov-fail-under=70
+      displayName: Run tests
+      workingDirectory: $(workingDir)
+      env:
+        AZURE_OPENAI_BASE_URL: https://placeholder.openai.azure.com/openai/v1/
+        AZURE_OPENAI_API_VERSION: preview
+        AZURE_OPENAI_DEPLOYMENT_NAME: gpt-4o
+        AZURE_SEARCH_ENDPOINT: https://placeholder.search.windows.net
+        AZURE_SEARCH_INDEX_NAME: hods-index
+        AZURE_SEARCH_SEMANTIC_CONFIGURATION: hods-index-semantic-configuration
+        AZURE_TENANT_ID: 00000000-0000-0000-0000-000000000000
+        AZURE_CLIENT_ID: 00000000-0000-0000-0000-000000000000
+
+    - task: PublishTestResults@2
+      displayName: Publish test results
+      condition: always()
+      inputs:
+        testResultsFormat: JUnit
+        testResultsFiles: $(Agent.TempDirectory)/test-results.xml
+
+    - task: PublishCodeCoverageResults@2
+      displayName: Publish coverage
+      condition: always()
+      inputs:
+        codeCoverageTool: Cobertura
+        summaryFileLocation: $(Agent.TempDirectory)/coverage.xml
+
+# ── Stage 2: Deploy ────────────────────────────────────────────────────────
+- stage: Deploy
+  displayName: Deploy API
+  dependsOn: CI
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: DeployAPI
+    displayName: Deploy to Azure App Service
+    environment: production
+    pool:
+      vmImage: ubuntu-latest
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: UsePythonVersion@0
+            displayName: Set up Python $(pythonVersion)
+            inputs:
+              versionSpec: $(pythonVersion)
+
+          - script: |
+              pip install -r requirements.txt
+              pip install --upgrade pip
+            displayName: Install dependencies
+            workingDirectory: $(workingDir)
+
+          - task: ArchiveFiles@2
+            displayName: Package app
+            inputs:
+              rootFolderOrFile: $(workingDir)
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/api.zip
+
+          - task: AzureWebApp@1
+            displayName: Deploy to App Service
+            inputs:
+              azureSubscription: $(serviceConnection)
+              appType: webAppLinux
+              appName: $(apiAppName)
+              package: $(Build.ArtifactStagingDirectory)/api.zip
+              runtimeStack: PYTHON|3.12
+              startUpCommand: uvicorn app.main:app --host 0.0.0.0 --port 8000

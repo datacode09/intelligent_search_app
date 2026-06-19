@@ -1,0 +1,123 @@
+## azure-pipelines/infra.yml
+## Validates and deploys Azure infrastructure (Bicep) to your subscription.
+## Trigger: any change under infra/ merged to main.
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [infra/*, scripts/create-indexer.py]
+
+pr:
+  branches:
+    include: [main]
+  paths:
+    include: [infra/*, scripts/create-indexer.py]
+
+variables:
+  resourceGroup: hods-rg
+  location: eastus
+  prefix: hods
+  serviceConnection: hods-azure-service-connection   # Azure DevOps → Project Settings → Service connections
+
+stages:
+
+# ── Stage 1: Validate (runs on every PR and push) ──────────────────────────
+- stage: Validate
+  displayName: Validate Bicep
+  jobs:
+  - job: Lint
+    displayName: Lint and what-if
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+
+    - task: AzureCLI@2
+      displayName: Lint Bicep
+      inputs:
+        azureSubscription: $(serviceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: az bicep lint --file infra/main.bicep
+
+    - task: AzureCLI@2
+      displayName: What-if preview
+      inputs:
+        azureSubscription: $(serviceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          DEPLOYER_OID=$(az ad signed-in-user show --query id -o tsv 2>/dev/null || \
+                         az account show --query id -o tsv)
+          az deployment group what-if \
+            --resource-group $(resourceGroup) \
+            --template-file infra/main.bicep \
+            --parameters prefix=$(prefix) \
+                         owner=azure-devops \
+                         deployerObjectId="$DEPLOYER_OID"
+
+# ── Stage 2: Deploy (main branch only, requires approval) ──────────────────
+- stage: Deploy
+  displayName: Deploy Infrastructure
+  dependsOn: Validate
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: DeployBicep
+    displayName: Deploy Bicep + Search Setup
+    environment: production          # Add manual approval gate in Azure DevOps Environments UI
+    pool:
+      vmImage: ubuntu-latest
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: Deploy Bicep
+            name: bicepDeploy
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                DEPLOYER_OID=$(az ad signed-in-user show --query id -o tsv 2>/dev/null || \
+                               az account show --query id -o tsv)
+                az deployment group create \
+                  --resource-group $(resourceGroup) \
+                  --template-file infra/main.bicep \
+                  --parameters prefix=$(prefix) \
+                               owner=azure-devops \
+                               deployerObjectId="$DEPLOYER_OID" \
+                  --query properties.outputs \
+                  --output json | tee outputs.json
+
+                # Surface key values as pipeline variables
+                echo "##vso[task.setvariable variable=searchEndpoint;isOutput=true]$(jq -r '.searchEndpoint.value' outputs.json)"
+                echo "##vso[task.setvariable variable=openAIEndpoint;isOutput=true]$(jq -r '.openAIEndpoint.value' outputs.json)"
+
+          - task: UsePythonVersion@0
+            displayName: Set up Python 3.12
+            inputs:
+              versionSpec: '3.12'
+
+          - script: pip install azure-search-documents azure-identity requests
+            displayName: Install indexer dependencies
+
+          - task: AzureCLI@2
+            displayName: Create Search index and indexer
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                export AZURE_SEARCH_ENDPOINT=$(jq -r '.searchEndpoint.value' outputs.json)
+                export AZURE_OPENAI_BASE_URL="$(jq -r '.openAIEndpoint.value' outputs.json)openai/v1/"
+                # Connection string from Key Vault via CLI (no plain-text secret in pipeline)
+                KV_NAME=$(jq -r '.keyVaultName.value' outputs.json)
+                export BLOB_STORAGE_CONNECTION_STRING=$(az keyvault secret show \
+                  --vault-name "$KV_NAME" \
+                  --name blob-storage-connection-string \
+                  --query value -o tsv)
+                python scripts/create-indexer.py

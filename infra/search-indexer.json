@@ -1,0 +1,83 @@
+{
+  "_comment": "This is the MISSING PIECE — the pipeline from Blob Storage → Azure AI Search. Run scripts/create-indexer.py after deploying infra.",
+
+  "dataSource": {
+    "name": "hods-blob-datasource",
+    "type": "azureblob",
+    "credentials": {
+      "connectionString": "REPLACE_WITH_STORAGE_CONNECTION_STRING"
+    },
+    "container": {
+      "name": "ingest-output"
+    }
+  },
+
+  "skillset": {
+    "name": "hods-skillset",
+    "description": "Splits documents into chunks and vectorizes them",
+    "skills": [
+      {
+        "@odata.type": "#Microsoft.Skills.Text.SplitSkill",
+        "name": "split-skill",
+        "description": "Split document into pages/chunks",
+        "context": "/document",
+        "textSplitMode": "pages",
+        "maximumPageLength": 2000,
+        "pageOverlapLength": 200,
+        "inputs": [{ "name": "text", "source": "/document/content" }],
+        "outputs": [{ "name": "textItems", "targetName": "pages" }]
+      },
+      {
+        "@odata.type": "#Microsoft.Skills.Text.AzureOpenAIEmbeddingSkill",
+        "name": "embedding-skill",
+        "description": "Generate embeddings for each chunk",
+        "context": "/document/pages/*",
+        "resourceUri": "REPLACE_WITH_OPENAI_ENDPOINT",
+        "deploymentId": "text-embedding-3-large",
+        "modelName": "text-embedding-3-large",
+        "dimensions": 3072,
+        "inputs": [{ "name": "text", "source": "/document/pages/*" }],
+        "outputs": [{ "name": "embedding", "targetName": "text_vector" }]
+      }
+    ],
+    "indexProjections": {
+      "selectors": [
+        {
+          "targetIndexName": "hods-index",
+          "parentKeyFieldName": "parent_id",
+          "sourceContext": "/document/pages/*",
+          "mappings": [
+            { "name": "content",      "source": "/document/pages/*" },
+            { "name": "text_vector",  "source": "/document/pages/*/text_vector" },
+            { "name": "DocumentName", "source": "/document/metadata_storage_name" },
+            { "name": "DocumentUrl",  "source": "/document/metadata_storage_path" },
+            { "name": "Prefix",       "source": "/document/metadata_Prefix" },
+            { "name": "ContentType",  "source": "/document/metadata_ContentType" },
+            { "name": "Modified",     "source": "/document/metadata_Modified" }
+          ]
+        }
+      ],
+      "parameters": { "projectionMode": "generatedKeyAsId" }
+    }
+  },
+
+  "indexer": {
+    "name": "hods-blob-indexer",
+    "dataSourceName": "hods-blob-datasource",
+    "targetIndexName": "hods-index",
+    "skillsetName": "hods-skillset",
+    "schedule": { "interval": "PT1H" },
+    "parameters": {
+      "configuration": {
+        "dataToExtract": "contentAndMetadata",
+        "parsingMode": "default"
+      }
+    },
+    "fieldMappings": [
+      { "sourceFieldName": "metadata_storage_name", "targetFieldName": "DocumentName" },
+      { "sourceFieldName": "metadata_storage_path", "targetFieldName": "DocumentUrl" },
+      { "sourceFieldName": "metadata_Prefix",       "targetFieldName": "Prefix" },
+      { "sourceFieldName": "metadata_Modified",     "targetFieldName": "Modified" }
+    ]
+  }
+}

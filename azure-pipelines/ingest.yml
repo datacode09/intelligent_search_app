@@ -1,0 +1,119 @@
+## azure-pipelines/ingest.yml
+## Lints, tests, and deploys the SharePoint ingest Azure Function (poc-hods-ingest).
+## Trigger: any change under poc-hods-ingest/ merged to main.
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [poc-hods-ingest/**]
+
+pr:
+  branches:
+    include: [main]
+  paths:
+    include: [poc-hods-ingest/**]
+
+variables:
+  serviceConnection: hods-azure-service-connection
+  functionAppName: $(FUNCTION_APP_NAME)    # Set in Azure DevOps → Pipelines → Variables
+  pythonVersion: '3.13'
+  workingDir: poc-hods-ingest
+
+stages:
+
+# ── Stage 1: CI ───────────────────────────────────────────────────────────
+- stage: CI
+  displayName: Lint and Test
+  jobs:
+  - job: Test
+    displayName: Ruff lint + pytest
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+
+    - task: UsePythonVersion@0
+      displayName: Set up Python $(pythonVersion)
+      inputs:
+        versionSpec: $(pythonVersion)
+
+    - script: pip install -r requirements.txt ruff pytest pytest-cov
+      displayName: Install dependencies
+      workingDirectory: $(workingDir)
+
+    - script: ruff check . --output-format=junit --output-file=$(Agent.TempDirectory)/ruff-results.xml
+      displayName: Lint (ruff)
+      workingDirectory: $(workingDir)
+
+    - script: ruff format --check .
+      displayName: Format check
+      workingDirectory: $(workingDir)
+
+    - script: |
+        pytest tests/ -v \
+          --cov=. \
+          --cov-report=term-missing \
+          --cov-report=xml:$(Agent.TempDirectory)/coverage.xml \
+          --junitxml=$(Agent.TempDirectory)/test-results.xml \
+          --cov-fail-under=60
+      displayName: Run tests
+      workingDirectory: $(workingDir)
+
+    - task: PublishTestResults@2
+      displayName: Publish test results
+      condition: always()
+      inputs:
+        testResultsFormat: JUnit
+        testResultsFiles: $(Agent.TempDirectory)/test-results.xml
+
+    - task: PublishCodeCoverageResults@2
+      displayName: Publish coverage
+      condition: always()
+      inputs:
+        codeCoverageTool: Cobertura
+        summaryFileLocation: $(Agent.TempDirectory)/coverage.xml
+
+# ── Stage 2: Deploy ────────────────────────────────────────────────────────
+- stage: Deploy
+  displayName: Deploy Function App
+  dependsOn: CI
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: DeployFunction
+    displayName: Deploy to Azure Function App
+    environment: production
+    pool:
+      vmImage: ubuntu-latest
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: UsePythonVersion@0
+            displayName: Set up Python $(pythonVersion)
+            inputs:
+              versionSpec: $(pythonVersion)
+
+          - script: pip install -r requirements.txt
+            displayName: Install dependencies
+            workingDirectory: $(workingDir)
+
+          - task: ArchiveFiles@2
+            displayName: Package function
+            inputs:
+              rootFolderOrFile: $(workingDir)
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/ingest.zip
+
+          - task: AzureFunctionApp@2
+            displayName: Deploy Function App
+            inputs:
+              connectedServiceNameARM: $(serviceConnection)
+              appType: functionAppLinux
+              appName: $(functionAppName)
+              package: $(Build.ArtifactStagingDirectory)/ingest.zip
+              runtimeStack: PYTHON|3.13
+              deploymentMethod: zipDeploy

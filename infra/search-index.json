@@ -1,0 +1,60 @@
+{
+  "name": "hods-index",
+  "fields": [
+    { "name": "chunk_id",       "type": "Edm.String",              "key": true,  "filterable": true,  "sortable": true  },
+    { "name": "parent_id",      "type": "Edm.String",              "key": false, "filterable": true,  "retrievable": true },
+    { "name": "DocumentName",   "type": "Edm.String",              "searchable": true,  "retrievable": true },
+    { "name": "DocumentUrl",    "type": "Edm.String",              "retrievable": true },
+    { "name": "Prefix",         "type": "Edm.String",              "searchable": true,  "filterable": true,  "retrievable": true },
+    { "name": "ContentType",    "type": "Collection(Edm.String)",  "searchable": true,  "filterable": true,  "retrievable": true },
+    { "name": "Modified",       "type": "Edm.String",              "retrievable": true },
+    { "name": "content",        "type": "Edm.String",              "searchable": true,  "retrievable": true },
+    {
+      "name": "text_vector",
+      "type": "Collection(Edm.Single)",
+      "searchable": true,
+      "retrievable": false,
+      "dimensions": 3072,
+      "vectorSearchProfile": "hods-vector-profile"
+    }
+  ],
+  "vectorSearch": {
+    "profiles": [
+      {
+        "name": "hods-vector-profile",
+        "algorithm": "hods-hnsw",
+        "vectorizer": "hods-openai-vectorizer"
+      }
+    ],
+    "algorithms": [
+      {
+        "name": "hods-hnsw",
+        "kind": "hnsw",
+        "hnswParameters": { "metric": "cosine", "m": 4, "efConstruction": 400, "efSearch": 500 }
+      }
+    ],
+    "vectorizers": [
+      {
+        "name": "hods-openai-vectorizer",
+        "kind": "azureOpenAI",
+        "azureOpenAIParameters": {
+          "resourceUri": "REPLACE_WITH_OPENAI_ENDPOINT",
+          "deploymentId": "text-embedding-3-large",
+          "modelName": "text-embedding-3-large"
+        }
+      }
+    ]
+  },
+  "semantic": {
+    "configurations": [
+      {
+        "name": "hods-index-semantic-configuration",
+        "prioritizedFields": {
+          "contentFields":      [{ "fieldName": "content" }],
+          "keywordsFields":     [{ "fieldName": "DocumentName" }, { "fieldName": "Prefix" }],
+          "titleField":         { "fieldName": "DocumentName" }
+        }
+      }
+    ]
+  }
+}
