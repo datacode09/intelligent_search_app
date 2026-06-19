@@ -1,0 +1,70 @@
+{
+  "@odata.context": "https://hydro-search.search.windows.net/indexes/hods-index/docs/$metadata#docs(*)",
+  "value": [
+    {
+      "@search.score": 0.9821,
+      "@search.rerankerScore": 2.41,
+
+      "id": "doc-001",
+      "fileName": "Electrical Safety Gloves Standard.pdf",
+      "sharepointPath": "https://contoso.sharepoint.com/sites/hods/Shared Documents/Safety/Electrical Safety Gloves Standard.pdf",
+      "blobPath": "https://storageaccount.blob.core.windows.net/hods-docs/electrical-safety-gloves.pdf",
+
+      "category": "Safety",
+      "documentId": "HODS-ES-001",
+      "lastModified": "2025-12-10T14:23:00Z",
+      "author": "Safety Compliance Team",
+
+      "purposeScope": "Defines the required standards and usage guidelines for electrical safety gloves to ensure worker protection when handling energized systems.",
+
+      "@search.highlights": {
+        "content": [
+          "All <em>gloves</em> must be inspected prior to use...",
+          "Electrical <em>safety</em> procedures require compliance with..."
+        ]
+      },
+
+      "@search.captions": [
+        {
+          "text": "Defines inspection and usage requirements for electrical safety gloves used in field operations.",
+          "highlights": "Defines inspection and usage requirements for <em>electrical safety gloves</em> used in field operations."
+        }
+      ],
+
+      "content": null
+    },
+    {
+      "@search.score": 0.9214,
+      "@search.rerankerScore": 2.12,
+
+      "id": "doc-002",
+      "fileName": "Arc Flash Protection Guidelines.pdf",
+      "sharepointPath": "https://contoso.sharepoint.com/sites/hods/Shared Documents/Safety/Arc Flash Protection Guidelines.pdf",
+      "blobPath": "https://storageaccount.blob.core.windows.net/hods-docs/arc-flash-guidelines.pdf",
+
+      "category": "Safety",
+      "documentId": "HODS-AF-014",
+      "lastModified": "2026-01-22T09:11:00Z",
+      "author": "Engineering Safety Office",
+
+      "purposeScope": "Provides procedures and regulatory requirements for arc flash hazard identification and mitigation.",
+
+      "@search.highlights": {
+        "content": [
+          "<em>Arc flash</em> incidents can result in serious injury...",
+          "All personnel must follow <em>protection guidelines</em>..."
+        ]
+      },
+
+      "@search.captions": [
+        {
+          "text": "Describes hazard mitigation techniques for arc flash incidents in electrical environments.",
+          "highlights": "Describes hazard mitigation techniques for <em>arc flash</em> incidents."
+        }
+      ],
+
+      "content": null
+    }
+  ],
+  "count": 2
+}
