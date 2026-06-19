@@ -44,7 +44,7 @@ API Component – Development,42,Write unit tests,6 test cases: health auth filt
 API Component – Development,43,Add pytest / coverage config,pyproject.toml or pytest.ini with 70% coverage threshold,Not Done,No pytest config file; threshold set only in pipeline YAML
 UI Component – Design,44,Define component structure,React SPA: SearchBar ResultsList ResultCard FilterPanel,Done,Implemented in hydro-one-hods-ui/src/
 UI Component – Design,45,Define API integration,Axios/fetch calls to /OptimizeHybridQueries then /query with Bearer token,Done,Implemented in hydro-one-hods-ui/src/
-UI Component – Design,46,Define MSAL authentication flow,@azure/msal-react SPA auth with Entra ID; token injected in API headers,Done,Implemented in hydro-one-hods-ui/src/
+UI Component – Design,46,Define MSAL authentication flow,@azure/msal-react SPA auth with Entra ID; token injected in API headers,Not Done,ISSUE-5: authConfig.js missing; no MsalProvider; no Authorization header in fetch calls — see TODO in App.jsx
 UI Component – Development,47,Implement search form,Input + submit; calls OptimizeHybridQueries then passes result to /query,Done,hydro-one-hods-ui/src/
 UI Component – Development,48,Implement results display,Show document title URL content type prefix and extractive caption,Done,hydro-one-hods-ui/src/
 UI Component – Development,49,Implement filter panel,Prefix and ContentType filters sent as OData filter string,Done,hydro-one-hods-ui/src/
@@ -80,7 +80,7 @@ Search Pipeline – Development,78,Configure extractive answers/captions,QueryAn
 Integration,79,Connect ingest output to indexer input,Blob container ingest-output used as datasource for AI Search indexer,Done,infra/search-indexer.json datasource container
 Integration,80,Connect API to AI Search,SearchClient pointed at search service via env var AZURE_SEARCH_ENDPOINT,Done,search_index.py get_search_client()
 Integration,81,Connect API to Azure OpenAI,AzureOpenAI client pointed at AZURE_OPENAI_ENDPOINT,Done,llm.py get_client()
-Integration,82,Connect UI to API,VITE_API_BASE_URL build-time env var; Bearer token from MSAL,Done,hydro-one-hods-ui Vite config + API calls
+Integration,82,Connect UI to API,VITE_API_BASE_URL build-time env var; Bearer token from MSAL,Not Done,VITE_API_BASE_URL wired up but Authorization header never sent — MSAL not integrated (ISSUE-5)
 Integration,83,Connect Function App to SharePoint,SHAREPOINT_SITE_URL + CLIENT_ID + CLIENT_SECRET from Key Vault,Done,function_app.py reads env vars; KV refs in Bicep
 Integration,84,Connect Function App to Blob Storage,BLOB_STORAGE_CONNECTION_STRING from Key Vault,Done,function_app.py BlobServiceClient
 Integration,85,End-to-end smoke test (manual),Trigger ingest → verify blobs → verify index populated → run search query,Not Done,Manual step; requires Azure resources deployed
