@@ -1,0 +1,130 @@
+Category,#,Task,Description,Status,Notes
+Repo Setup,1,Create intelligent_search_app meta-repo,Initialize single flat GitHub repository to hold all components,Done,Committed to https://github.com/datacode09/intelligent_search_app
+Repo Setup,2,Clone poc-hods-ingest source,Copy ingest function source into meta-repo as plain directory,Done,poc-hods-ingest/ present with .git stripped
+Repo Setup,3,Clone hydro-one-hods-api source,Copy API backend source into meta-repo as plain directory,Done,hydro-one-hods-api/ present with .git stripped
+Repo Setup,4,Clone hydro-one-hods-ui source,Copy frontend source into meta-repo as plain directory,Done,hydro-one-hods-ui/ present with .git stripped
+Repo Setup,5,Remove git submodule entries,Deinit and rm cached submodule references; delete .gitmodules,Done,Fixed after initial commit had embedded submodules
+Repo Setup,6,Push all source to main branch,Single commit with all three component directories as plain code,Done,Branch: main
+Repo Setup,7,Add top-level README / SETUP.md,End-to-end setup guide from zero Azure account to running app,Done,SETUP.md at repo root (9 steps + troubleshooting)
+Repo Setup,8,Add .gitignore,Ignore __pycache__ / .env / node_modules / dist / .venv,Not Done,No .gitignore present yet
+Architecture Design,9,Document overall system architecture,Diagram/description: SharePoint → Ingest → Blob → Search → API → UI,Not Done,Architecture implied by code but no formal diagram
+Architecture Design,10,Define Azure resource list,Enumerate all Azure services required with SKU/tier decisions,Done,Documented in infra/main.bicep parameters and resources
+Architecture Design,11,Define authentication flow,Entra ID app registration → MSAL token → Bearer JWT → API validation,Done,Described in SETUP.md step 3; implemented in auth.py
+Architecture Design,12,Define data flow,SharePoint list → Graph API poll → Blob Storage → AI Search indexer → API query,Done,Implemented end-to-end across all components
+Architecture Design,13,Define RBAC model,Managed Identity for all Azure-to-Azure auth; no stored secrets in code,Done,DefaultAzureCredential used throughout; KV references for secrets
+Architecture Design,14,Define search strategy,Hybrid BM25 + vector with semantic reranking and extractive answers,Done,Implemented in search_index.py with VectorizableTextQuery
+Architecture Design,15,Define CI/CD strategy,Azure DevOps YAML pipelines with Workload Identity Federation (OIDC),Done,azure-pipelines/ directory with 4 pipeline files
+Architecture Design,16,Define observability strategy,App Insights + Log Analytics; OpenTelemetry SDK in API,Done,telemetry.py + App Insights resource in Bicep
+Ingest Component – Design,17,Identify SharePoint source structure,Determine list columns to sync (DocumentName ContentType Prefix Modified),Done,function_app.py maps these metadata fields
+Ingest Component – Design,18,Design incremental sync logic,Poll only documents modified since last_sync timestamp stored in Blob,Done,_parse_last_sync + last_sync.txt pattern in function_app.py
+Ingest Component – Design,19,Design blob naming convention,Sanitise filenames: strip path separators replace spaces with underscores,Done,_to_blob_name() in function_app.py
+Ingest Component – Design,20,Design metadata encoding,Convert SharePoint LookupValue lists to ASCII blob metadata strings,Done,_to_blob_metadata_value() in function_app.py
+Ingest Component – Development,21,Implement Graph API authentication,OAuth2 client-credentials flow to obtain access token for Sites.Read.All,Done,get_access_token() in function_app.py
+Ingest Component – Development,22,Implement SharePoint list query,GET /sites/{id}/lists/{id}/items with $expand=fields and $filter on Modified,Done,get_sharepoint_documents() in function_app.py
+Ingest Component – Development,23,Implement file download from SharePoint,Download document bytes via /driveItem/content endpoint,Done,download_file() in function_app.py
+Ingest Component – Development,24,Implement Blob Storage upload,Upload bytes + metadata dict to Azure Blob Storage container,Done,upload_to_blob() in function_app.py
+Ingest Component – Development,25,Implement timer trigger Azure Function,Python Azure Function with timer trigger (daily schedule),Done,function_app.py with @app.timer_trigger
+Ingest Component – Development,26,Add host.json and requirements.txt,Azure Functions host configuration and Python dependencies,Done,host.json + requirements.txt present in poc-hods-ingest/
+Ingest Component – Development,27,Add ruff linting config,ruff.toml with E/F/W/I/UP/B/S rules target py312,Not Done,ruff.toml not present in poc-hods-ingest/
+Ingest Component – Development,28,Write unit tests,pytest tests for _parse_last_sync _to_blob_name _to_blob_metadata_value,Done,poc-hods-ingest/tests/test_ingest.py – 11 test cases
+Ingest Component – Development,29,Add pytest / coverage config,pytest.ini or pyproject.toml with coverage threshold 60%,Not Done,No pytest config file present
+API Component – Design,30,Design query request/response models,Pydantic models for QueryRequest OptimizeHybridQueriesRequest/Response,Done,app/models.py in hydro-one-hods-api
+API Component – Design,31,Design OData filter builder,Safe filter string builder with single-quote escaping injection prevention,Done,build_filter() in app/search_index.py
+API Component – Design,32,Design JWT validation,RS256 validation via JWKS endpoint with audience/issuer/exp checks,Done,app/auth.py with python-jose
+API Component – Design,33,Design CORS policy,Restrict allowed origins to ALLOWED_ORIGINS env var,Done,CORSMiddleware in main.py
+API Component – Development,34,Implement /health endpoint,Unauthenticated liveness probe returning {"status":"ok"},Done,main.py line 38-40
+API Component – Development,35,Implement /query endpoint,Hybrid search with auth guard; returns hits captions answers,Done,main.py + search_index.py run_search()
+API Component – Development,36,Implement /OptimizeHybridQueries endpoint,GPT-4o query optimization returning OptimizedQuery + keywords JSON,Done,main.py + llm.py
+API Component – Development,37,Implement Azure OpenAI client,DefaultAzureCredential-backed AzureOpenAI client (no API key),Done,app/llm.py get_client()
+API Component – Development,38,Implement Azure AI Search client,SearchClient with DefaultAzureCredential; hybrid + semantic query,Done,app/search_index.py
+API Component – Development,39,Implement telemetry bootstrap,configure_azure_monitor() on startup via APPLICATIONINSIGHTS_CONNECTION_STRING,Done,app/telemetry.py
+API Component – Development,40,Add requirements.txt,All pinned deps including python-jose azure-monitor-opentelemetry,Done,hydro-one-hods-api/requirements.txt
+API Component – Development,41,Add ruff.toml,Linting config target py312 line-length 100,Done,hydro-one-hods-api/ruff.toml
+API Component – Development,42,Write unit tests,6 test cases: health auth filter injection,Done,hydro-one-hods-api/tests/test_health.py
+API Component – Development,43,Add pytest / coverage config,pyproject.toml or pytest.ini with 70% coverage threshold,Not Done,No pytest config file; threshold set only in pipeline YAML
+UI Component – Design,44,Define component structure,React SPA: SearchBar ResultsList ResultCard FilterPanel,Done,Implemented in hydro-one-hods-ui/src/
+UI Component – Design,45,Define API integration,Axios/fetch calls to /OptimizeHybridQueries then /query with Bearer token,Done,Implemented in hydro-one-hods-ui/src/
+UI Component – Design,46,Define MSAL authentication flow,@azure/msal-react SPA auth with Entra ID; token injected in API headers,Done,Implemented in hydro-one-hods-ui/src/
+UI Component – Development,47,Implement search form,Input + submit; calls OptimizeHybridQueries then passes result to /query,Done,hydro-one-hods-ui/src/
+UI Component – Development,48,Implement results display,Show document title URL content type prefix and extractive caption,Done,hydro-one-hods-ui/src/
+UI Component – Development,49,Implement filter panel,Prefix and ContentType filters sent as OData filter string,Done,hydro-one-hods-ui/src/
+UI Component – Development,50,Add Vite build config,vite.config.ts with VITE_API_BASE_URL env var,Done,hydro-one-hods-ui/vite.config.ts
+UI Component – Development,51,Add ESLint config,eslint.config.js for React + TypeScript linting,Done,hydro-one-hods-ui/eslint.config.js
+UI Component – Development,52,Write UI unit/component tests,Jest or Vitest component tests,Not Done,No test files found in hydro-one-hods-ui/src/__tests__
+Infrastructure – Design,53,Design resource naming convention,Use prefix parameter to namespace all resources (hods-dev- etc),Done,All Bicep resources use ${prefix}-{resource} naming
+Infrastructure – Design,54,Design Key Vault secret references,App Settings use @Microsoft.KeyVault(SecretUri=...) syntax; no plaintext,Done,Function App and API App settings in main.bicep
+Infrastructure – Design,55,Design network security,HTTPS-only app services; no public blob access; CORS on API only,Done,Enforced in main.bicep httpsOnly + allowBlobPublicAccess=false
+Infrastructure – Development,56,Write Bicep for Storage Account,Standard LRS; no public blob access,Done,infra/main.bicep – storageAccount resource
+Infrastructure – Development,57,Write Bicep for Key Vault,RBAC auth; soft delete 90d; purge protection,Done,infra/main.bicep – keyVault resource
+Infrastructure – Development,58,Write Bicep for Log Analytics,PerGB2018 SKU; 90-day retention,Done,infra/main.bicep – logAnalytics resource
+Infrastructure – Development,59,Write Bicep for Application Insights,Linked to Log Analytics workspace,Done,infra/main.bicep – appInsights resource
+Infrastructure – Development,60,Write Bicep for Azure AI Search,Basic SKU; semantic search free tier,Done,infra/main.bicep – searchService resource
+Infrastructure – Development,61,Write Bicep for Azure OpenAI,S0 SKU; gpt-4o + text-embedding-3-large deployments,Done,infra/main.bicep – openAI resource
+Infrastructure – Development,62,Write Bicep for App Service Plan,P1v3 PremiumV3 Linux,Done,infra/main.bicep – appServicePlan resource
+Infrastructure – Development,63,Write Bicep for Autoscale,1–3 instances; CPU >70% scale-out,Done,infra/main.bicep – autoscale resource
+Infrastructure – Development,64,Write Bicep for Function App,Python 3.13; HTTPS only; KV secret references,Done,infra/main.bicep – functionApp resource
+Infrastructure – Development,65,Write Bicep for API App Service,Python 3.12; System Assigned Managed Identity; HTTPS only,Done,infra/main.bicep – apiApp resource
+Infrastructure – Development,66,Write Bicep for Static Web App,Standard tier for SPA hosting,Done,infra/main.bicep – staticWebApp resource
+Infrastructure – Development,67,Add RBAC role assignments in Bicep,4 assignments: Deployer→KV; FunctionApp→KV; APIApp→OpenAI; APIApp→Search,Done,infra/main.bicep – roleAssignment resources
+Infrastructure – Development,68,Write deployment PowerShell script,deploy.ps1 creates RG deploys Bicep writes .env files,Done,scripts/deploy.ps1
+Search Pipeline – Design,69,Design AI Search index schema,Fields: chunk_id parent_id DocumentName DocumentUrl Prefix ContentType content text_vector,Done,infra/search-index.json
+Search Pipeline – Design,70,Design chunking strategy,SplitSkill 2000 chars 200 overlap; chunk_id as dedup key,Done,infra/search-indexer.json skillset definition
+Search Pipeline – Design,71,Design embedding strategy,Azure OpenAI text-embedding-3-large 3072 dims via EmbeddingSkill + vectorizer,Done,infra/search-indexer.json + search-index.json vectorizer
+Search Pipeline – Design,72,Design indexer schedule,PT1H (hourly) to keep index in sync with Blob Storage,Done,infra/search-indexer.json schedule
+Search Pipeline – Development,73,Write search index JSON,Full index definition with vector profile HNSW cosine,Done,infra/search-index.json
+Search Pipeline – Development,74,Write search indexer JSON,Data source + skillset + indexer with field mappings,Done,infra/search-indexer.json
+Search Pipeline – Development,75,Write create-indexer.py script,Python script to POST index datasource skillset indexer via REST API,Done,scripts/create-indexer.py
+Search Pipeline – Development,76,Configure server-side vectorization,VectorizableTextQuery so API never calls embeddings directly,Done,search_index.py uses VectorizableTextQuery
+Search Pipeline – Development,77,Configure semantic reranking,QueryType.SEMANTIC with hods-index-semantic-configuration,Done,search_index.py
+Search Pipeline – Development,78,Configure extractive answers/captions,QueryAnswerType.EXTRACTIVE + QueryCaptionType.EXTRACTIVE,Done,search_index.py
+Integration,79,Connect ingest output to indexer input,Blob container ingest-output used as datasource for AI Search indexer,Done,infra/search-indexer.json datasource container
+Integration,80,Connect API to AI Search,SearchClient pointed at search service via env var AZURE_SEARCH_ENDPOINT,Done,search_index.py get_search_client()
+Integration,81,Connect API to Azure OpenAI,AzureOpenAI client pointed at AZURE_OPENAI_ENDPOINT,Done,llm.py get_client()
+Integration,82,Connect UI to API,VITE_API_BASE_URL build-time env var; Bearer token from MSAL,Done,hydro-one-hods-ui Vite config + API calls
+Integration,83,Connect Function App to SharePoint,SHAREPOINT_SITE_URL + CLIENT_ID + CLIENT_SECRET from Key Vault,Done,function_app.py reads env vars; KV refs in Bicep
+Integration,84,Connect Function App to Blob Storage,BLOB_STORAGE_CONNECTION_STRING from Key Vault,Done,function_app.py BlobServiceClient
+Integration,85,End-to-end smoke test (manual),Trigger ingest → verify blobs → verify index populated → run search query,Not Done,Manual step; requires Azure resources deployed
+Integration,86,Verify JWT validation end-to-end,UI obtains token → sends to API → API validates against Entra JWKS,Not Done,Manual step; requires Entra app registration
+Testing,87,API unit tests – health endpoint,GET /health returns 200 {"status":"ok"},Done,test_health.py::test_health
+Testing,88,API unit tests – /query requires auth,POST /query without token returns 401,Done,test_health.py::test_query_requires_auth
+Testing,89,API unit tests – /OptimizeHybridQueries requires auth,POST /OptimizeHybridQueries without token returns 401,Done,test_health.py::test_optimize_requires_auth
+Testing,90,API unit tests – filter builder basic,build_filter with prefix and content type produces correct OData,Done,test_health.py::test_filter_builder
+Testing,91,API unit tests – filter builder empty,build_filter with no filters returns empty string,Done,test_health.py::test_filter_builder_empty
+Testing,92,API unit tests – OData injection prevention,Single quotes in filter values are escaped,Done,test_health.py::test_filter_odata_injection
+Testing,93,Ingest unit tests – parse_last_sync None,None input returns epoch datetime,Done,test_ingest.py::TestParseLastSync::test_none_returns_epoch
+Testing,94,Ingest unit tests – parse_last_sync empty string,Empty string returns epoch datetime,Done,test_ingest.py::TestParseLastSync::test_empty_string_returns_epoch
+Testing,95,Ingest unit tests – parse_last_sync ISO8601 Z,ISO8601 with Z suffix parses correctly,Done,test_ingest.py::TestParseLastSync::test_iso8601_z
+Testing,96,Ingest unit tests – parse_last_sync offset,ISO8601 with +00:00 suffix parses correctly,Done,test_ingest.py::TestParseLastSync::test_iso8601_offset
+Testing,97,Ingest unit tests – parse_last_sync legacy format,Space-separated datetime parses correctly,Done,test_ingest.py::TestParseLastSync::test_legacy_format
+Testing,98,Ingest unit tests – parse_last_sync unrecognised,Bad string returns epoch datetime,Done,test_ingest.py::TestParseLastSync::test_unrecognized_returns_epoch
+Testing,99,Ingest unit tests – blob name simple,Simple filename returns unchanged,Done,test_ingest.py::TestToBlobName::test_simple_name
+Testing,100,Ingest unit tests – blob name strips path,Path prefix stripped from filename,Done,test_ingest.py::TestToBlobName::test_strips_path
+Testing,101,Ingest unit tests – blob name replaces spaces,Spaces replaced with underscores,Done,test_ingest.py::TestToBlobName::test_replaces_spaces
+Testing,102,Ingest unit tests – blob name empty,Empty name returns 'file',Done,test_ingest.py::TestToBlobName::test_empty_becomes_file
+Testing,103,Ingest unit tests – metadata string,String value returned as-is,Done,test_ingest.py::TestToBlobMetadataValue::test_string
+Testing,104,Ingest unit tests – metadata None,None returns empty string,Done,test_ingest.py::TestToBlobMetadataValue::test_none
+Testing,105,Ingest unit tests – metadata list of lookups,List of LookupValue dicts joined to string,Done,test_ingest.py::TestToBlobMetadataValue::test_list_of_lookups
+Testing,106,Ingest unit tests – metadata dict lookup,Single LookupValue dict returns value,Done,test_ingest.py::TestToBlobMetadataValue::test_dict_lookup
+Testing,107,Ingest unit tests – metadata non-ASCII,Non-ASCII chars stripped to ASCII,Done,test_ingest.py::TestToBlobMetadataValue::test_non_ascii_stripped
+Testing,108,UI component tests,Jest/Vitest tests for SearchBar ResultsList FilterPanel,Not Done,No test files in hydro-one-hods-ui
+Testing,109,Integration tests,End-to-end test hitting real or emulated Azure services,Not Done,Not implemented
+Testing,110,Load / performance tests,k6 or locust test to verify autoscale triggers,Not Done,Not implemented
+Deployment – CI/CD,111,Create Azure DevOps project,Create new org and project in dev.azure.com,Not Done,Manual step – requires human login
+Deployment – CI/CD,112,Create Workload Identity Federation service connection,OIDC service connection named hods-azure-service-connection,Not Done,Manual step – see azure-pipelines/README.md step 2
+Deployment – CI/CD,113,Register infra pipeline,azure-pipelines/infra.yml – Validate + Deploy stages,Done,Pipeline YAML written; registration is manual step
+Deployment – CI/CD,114,Register API pipeline,azure-pipelines/api.yml – CI (lint+test+coverage) + Deploy,Done,Pipeline YAML written; registration is manual step
+Deployment – CI/CD,115,Register ingest pipeline,azure-pipelines/ingest.yml – CI + Deploy Azure Function,Done,Pipeline YAML written; registration is manual step
+Deployment – CI/CD,116,Register UI pipeline,azure-pipelines/ui.yml – CI (npm build) + Deploy Static Web App,Done,Pipeline YAML written; registration is manual step
+Deployment – CI/CD,117,Set pipeline variables,API_APP_NAME FUNCTION_APP_NAME API_APP_URL STATIC_WEB_APP_TOKEN,Not Done,Manual step – set in Azure DevOps pipeline settings
+Deployment – CI/CD,118,Create production environment with approval gate,Environment named 'production' with manual approval required before deploy,Not Done,Manual step – see azure-pipelines/README.md step 5
+Deployment – CI/CD,119,Enable branch policy on main,Require PR + passing CI before merge to main,Not Done,Manual step – see azure-pipelines/README.md step 6
+Deployment – Azure,120,Run deploy.ps1,az login; execute scripts/deploy.ps1 to provision all Azure resources,Not Done,Manual step – requires Azure subscription
+Deployment – Azure,121,Store SharePoint credentials in Key Vault,Set SHAREPOINT_CLIENT_ID and SHAREPOINT_CLIENT_SECRET secrets in KV,Not Done,Manual step – see SETUP.md step 5
+Deployment – Azure,122,Register Entra ID app for SharePoint access,App registration with Sites.Read.All permission; client secret,Not Done,Manual step – see SETUP.md step 3
+Deployment – Azure,123,Register Entra ID app for UI/API auth,App registration exposing API scope; SPA redirect URIs,Not Done,Manual step – see SETUP.md step 3
+Deployment – Azure,124,Deploy ingest Function App,az functionapp deployment via pipeline or manual zip deploy,Not Done,Automated via azure-pipelines/ingest.yml once pipeline registered
+Deployment – Azure,125,Deploy API App Service,az webapp deployment via pipeline,Not Done,Automated via azure-pipelines/api.yml once pipeline registered
+Deployment – Azure,126,Deploy UI to Static Web App,Azure Static Web Apps action via pipeline,Not Done,Automated via azure-pipelines/ui.yml once pipeline registered
+Deployment – Azure,127,Trigger first ingest run,Manually trigger timer function or wait for schedule to sync SharePoint docs,Not Done,Manual step – see SETUP.md step 9
+Deployment – Azure,128,Verify search index populated,Check AI Search index document count > 0 after first ingest run,Not Done,Manual step – use Azure Portal or search explorer
+Deployment – Azure,129,Run end-to-end acceptance test,Open UI; authenticate; perform a search; verify results returned,Not Done,Manual step – final acceptance sign-off
