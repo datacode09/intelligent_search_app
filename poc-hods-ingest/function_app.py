@@ -283,12 +283,13 @@ def _upload_changed_files(
     site_id: str,
     last_sync: datetime.datetime,
     headers: Dict[str, str],
-    max_files: int = 5,
-) -> int:
+    max_files: int = 500,
+) -> "tuple[int, Optional[datetime.datetime]]":
     # Resolve the SharePoint list ID once for the whole run.
     list_id = _get_drive_list_id(drive_id, headers)
     prefix_lookup_info = _get_lookup_column_info(site_id, list_id, "Prefix", headers)
     uploaded = 0
+    earliest_success: Optional[datetime.datetime] = None
     for item in _list_all_items(drive_id, headers):
         if uploaded >= max_files:
             break
@@ -357,17 +358,15 @@ def _upload_changed_files(
 
         blob_client.upload_blob(content_response.content, overwrite=True, metadata=metadata or None)
         uploaded += 1
+        if earliest_success is None or modified_at < earliest_success:
+            earliest_success = modified_at
 
-    return uploaded
+    return uploaded, earliest_success
 
-# TODO [ISSUE-1 CRITICAL]: Timer fires every minute — will hit Graph API throttling (HTTP 429) on day 1.
-# Current:  "0 */1 * * * *"  → every minute
-# Fix:      "0 0 * * * *"    → top of every hour  (recommended for production)
-#           "0 0 2 * * *"    → daily at 02:00 UTC (if volume is low)
-# To test the fix locally, change the schedule below and run:
-#   func start
-# Verify in the Azure Functions host log that the next run shows the correct interval.
-@app.timer_trigger(schedule="0 */1 * * * *", arg_name="myTimer", run_on_startup=False,
+# Schedule is configurable via INGEST_SCHEDULE_CRON (defaults to hourly) so it
+# can be tightened for local testing without hitting MS Graph throttling
+# (HTTP 429) at production cadence.
+@app.timer_trigger(schedule=os.getenv("INGEST_SCHEDULE_CRON", "0 0 * * * *"), arg_name="myTimer", run_on_startup=False,
               use_monitor=False)
 def Ingest(myTimer: func.TimerRequest) -> None:
     
@@ -451,53 +450,26 @@ def Ingest(myTimer: func.TimerRequest) -> None:
         site_id = _resolve_site_id(site_hostname, site_path, headers, site_id_override)
         drive_id = _get_drive_id(site_id, drive_name, headers)
 
-        # TODO [ISSUE-2 CRITICAL]: max_files=5 means a 500-doc library needs 100 runs to fully index.
-        # At daily schedule that is ~3 months. Remove the cap or make it env-configurable.
-        # Fix — replace the hardcoded 5 with:
-        #   max_files = int(os.getenv("INGEST_MAX_FILES_PER_RUN", "500"))
-        # To test: set INGEST_MAX_FILES_PER_RUN=10 in local.settings.json and verify
-        # the function processes more than 5 files in a single run.
-        uploaded_count = _upload_changed_files(
+        max_files = int(os.getenv("INGEST_MAX_FILES_PER_RUN", "500"))
+        uploaded_count, earliest_success = _upload_changed_files(
             blob_service_client=blob_service_client,
             container_name=container_name,
             drive_id=drive_id,
             site_id=site_id,
             last_sync=last_sync,
             headers=headers,
-            max_files=5,
+            max_files=max_files,
         )
         logging.info("Completed SharePoint sync. Files uploaded: %s", uploaded_count)
     except Exception as exc:
         logging.exception("Failed to sync SharePoint files: %s", exc)
         return
     
-    # TODO [ISSUE-3 CRITICAL]: last-sync always advances to now_utc even if some files failed.
-    # If file #3 of 5 throws (e.g. Graph 403), items 4-5 are skipped and never retried
-    # because the next run starts from now_utc, not from the last successfully synced file.
-    #
-    # Fix — track the earliest modified_at of successfully uploaded files and only advance
-    # last-sync to that value:
-    #
-    #   # In _upload_changed_files, return the earliest successfully-uploaded modified_at:
-    #   def _upload_changed_files(...) -> tuple[int, datetime.datetime | None]:
-    #       earliest_success: datetime.datetime | None = None
-    #       ...
-    #       blob_client.upload_blob(...)
-    #       uploaded += 1
-    #       if earliest_success is None or modified_at < earliest_success:
-    #           earliest_success = modified_at
-    #       ...
-    #       return uploaded, earliest_success
-    #
-    #   uploaded_count, earliest_success = _upload_changed_files(...)
-    #   last_sync_time = (earliest_success or now_utc).isoformat()
-    #
-    # To test: mock _upload_changed_files to raise on the 3rd file; assert last-sync
-    # blob contains the modified_at of file #2, not now_utc.
-    #
-    # Update last-sync value in blob storage
+    # Advance last-sync only as far as the earliest successfully uploaded file's
+    # modified time, not to now_utc. If a mid-batch upload fails, files after it
+    # are retried on the next run instead of being silently skipped forever.
     try:
-        last_sync_time = now_utc.isoformat()
+        last_sync_time = (earliest_success or now_utc).isoformat()
         config_blob_client = blob_service_client.get_blob_client(container=container_name, blob="last-sync")
         config_blob_client.upload_blob(last_sync_time, overwrite=True)
         logging.info("Updated last-sync to: %s", last_sync_time)

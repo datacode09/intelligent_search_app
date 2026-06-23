@@ -10,6 +10,8 @@
     "SHAREPOINT_CLIENT_SECRET": "",
     "SHAREPOINT_SITE_HOSTNAME": "",
     "SHAREPOINT_SITE_PATH": "/sites/YourSiteName",
-    "SHAREPOINT_LIBRARY_DRIVE_NAME": "Documents"
+    "SHAREPOINT_LIBRARY_DRIVE_NAME": "Documents",
+    "INGEST_SCHEDULE_CRON": "0 0 * * * *",
+    "INGEST_MAX_FILES_PER_RUN": "500"
   }
 }

@@ -150,6 +150,11 @@ activemq-data/
 # Environments
 .env
 .envrc
+
+# Real local Azure Functions settings — contains secrets (SharePoint client
+# secret, storage connection strings). Copy local.settings.json.example to
+# local.settings.json and fill in your own values; never commit the result.
+local.settings.json
 .venv
 env/
 venv/
