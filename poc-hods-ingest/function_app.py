@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Dict, Iterable, List, Optional
 
 import requests
@@ -11,6 +12,27 @@ import requests
 from azure.storage.blob import BlobServiceClient
 
 app = func.FunctionApp()
+
+
+def _retry(call, attempts=3, base_delay=1.0, retry_on=(requests.exceptions.RequestException,)):
+    for attempt in range(1, attempts + 1):
+        try:
+            return call()
+        except retry_on as exc:
+            if attempt == attempts:
+                raise
+            logging.warning("Retrying after error (attempt %s/%s): %s", attempt, attempts, exc)
+            time.sleep(base_delay * (2 ** (attempt - 1)))
+
+
+def _download_and_upload(content_url, headers, blob_client, metadata):
+    with requests.get(content_url, headers=headers, stream=True, timeout=120) as content_response:
+        content_response.raise_for_status()
+        blob_client.upload_blob(
+            content_response.iter_content(chunk_size=4 * 1024 * 1024),
+            overwrite=True,
+            metadata=metadata or None,
+        )
 
 
 def _parse_last_sync(last_sync_raw: Optional[str]) -> datetime.datetime:
@@ -290,8 +312,11 @@ def _upload_changed_files(
     prefix_lookup_info = _get_lookup_column_info(site_id, list_id, "Prefix", headers)
     uploaded = 0
     earliest_success: Optional[datetime.datetime] = None
+    latest_success: Optional[datetime.datetime] = None
+    cap_hit = False
     for item in _list_all_items(drive_id, headers):
         if uploaded >= max_files:
+            cap_hit = True
             break
 
         if "file" not in item:
@@ -311,8 +336,6 @@ def _upload_changed_files(
             continue
 
         content_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content"
-        content_response = requests.get(content_url, headers=headers, timeout=120)
-        content_response.raise_for_status()
 
         blob_name = _to_blob_name(file_name)
         blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
@@ -356,12 +379,20 @@ def _upload_changed_files(
                 item_id, sorted(fields.keys()),
             )
 
-        blob_client.upload_blob(content_response.content, overwrite=True, metadata=metadata or None)
+        _retry(lambda: _download_and_upload(content_url, headers, blob_client, metadata))
         uploaded += 1
         if earliest_success is None or modified_at < earliest_success:
             earliest_success = modified_at
+        if latest_success is None or modified_at > latest_success:
+            latest_success = modified_at
 
-    return uploaded, earliest_success
+    # If the per-run cap was hit, only advance last-sync to the earliest
+    # uploaded file's time so files left over past the cap aren't skipped
+    # on the next run. Otherwise every changed file was processed, so
+    # advance to the latest uploaded file's time to avoid re-uploading the
+    # same files again next run.
+    sync_point = earliest_success if cap_hit else latest_success
+    return uploaded, sync_point
 
 # Schedule is configurable via INGEST_SCHEDULE_CRON (defaults to hourly) so it
 # can be tightened for local testing without hitting MS Graph throttling

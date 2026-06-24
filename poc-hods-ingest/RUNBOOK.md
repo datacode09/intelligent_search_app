@@ -129,6 +129,31 @@ Both are app settings in `local.settings.json`:
 | `INGEST_SCHEDULE_CRON` | `0 0 * * * *` (hourly) | Lower only for short local test windows. Running every minute against real SharePoint will trigger Graph throttling — don't use a tight schedule against production data. |
 | `INGEST_MAX_FILES_PER_RUN` | `500` | Lower (e.g. `10`) to do a quick smoke test against a large library without waiting for a full sync. |
 
+## 5. Optional — Azurite-backed idempotency integration test
+
+`tests/test_ingest_azurite_integration.py` runs the upload-then-advance-
+last-sync cycle three times in a row against a **real** `BlobServiceClient`
+backed by a temporary Azurite instance (only the SharePoint/Graph calls are
+mocked), and asserts the 2nd and 3rd runs upload 0 files. It needs Node/npx
+to launch Azurite itself, separate from the function host's own Azurite
+instance in section 2 — it starts and tears down its own instance on
+throwaway ports, so it won't conflict with one you already have running.
+
+```bash
+pytest tests/test_ingest_azurite_integration.py -v
+```
+
+It's automatically skipped (not failed) if `npx` isn't on `PATH`, so it
+never breaks CI, which only installs Python dependencies.
+
+## 6. Manual functional / E2E checklist
+
+See `E2E-CHECKLIST.md` for a checklist to work through by hand against a
+real SharePoint site and real Azure storage account — covers connectivity,
+managed-identity/Key-Vault permissions, the per-run file cap, error
+handling, and memory/streaming behavior on large files. Cannot be
+automated since it requires real tenant/subscription network access.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |

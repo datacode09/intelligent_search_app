@@ -4,13 +4,25 @@ import datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from function_app import (
+    _download_and_upload,
     _parse_last_sync,
+    _retry,
     _to_blob_metadata_value,
     _to_blob_name,
     _upload_changed_files,
 )
+
+
+def _make_streamed_response(chunks=(b"data",)):
+    response = MagicMock()
+    response.__enter__.return_value = response
+    response.__exit__.return_value = False
+    response.raise_for_status = MagicMock()
+    response.iter_content.return_value = list(chunks)
+    return response
 
 
 class TestParseLastSync:
@@ -102,13 +114,10 @@ class TestUploadChangedFiles:
             _make_item("3", "c.pdf", "2024-06-03T00:00:00Z"),
         ]
 
-        def content_get(url, headers, timeout):
+        def content_get(url, headers, stream, timeout):
             if "/items/2/content" in url:
                 raise RuntimeError("Graph 403")
-            response = MagicMock()
-            response.content = b"data"
-            response.raise_for_status = MagicMock()
-            return response
+            return _make_streamed_response()
 
         patches = self._patch_common(items, content_get)
         for p in patches:
@@ -131,11 +140,8 @@ class TestUploadChangedFiles:
     def test_max_files_caps_uploads(self):
         items = [_make_item(str(i), f"{i}.pdf", "2024-06-0%dT00:00:00Z" % (i + 1)) for i in range(3)]
 
-        def content_get(url, headers, timeout):
-            response = MagicMock()
-            response.content = b"data"
-            response.raise_for_status = MagicMock()
-            return response
+        def content_get(url, headers, stream, timeout):
+            return _make_streamed_response()
 
         patches = self._patch_common(items, content_get)
         for p in patches:
@@ -160,11 +166,8 @@ class TestUploadChangedFiles:
     def test_default_max_files_allows_more_than_five(self):
         items = [_make_item(str(i), f"{i}.pdf", "2024-06-0%dT00:00:00Z" % (i + 1)) for i in range(7)]
 
-        def content_get(url, headers, timeout):
-            response = MagicMock()
-            response.content = b"data"
-            response.raise_for_status = MagicMock()
-            return response
+        def content_get(url, headers, stream, timeout):
+            return _make_streamed_response()
 
         patches = self._patch_common(items, content_get)
         for p in patches:
@@ -183,3 +186,117 @@ class TestUploadChangedFiles:
         finally:
             for p in patches:
                 p.stop()
+
+    def test_empty_drive_returns_zero_uploads(self):
+        patches = self._patch_common([], lambda *a, **k: _make_streamed_response())
+        for p in patches:
+            p.start()
+        try:
+            blob_service_client = MagicMock()
+            uploaded, earliest_success = _upload_changed_files(
+                blob_service_client=blob_service_client,
+                container_name="ingest-output",
+                drive_id="drive-1",
+                site_id="site-1",
+                last_sync=datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
+                headers={},
+            )
+            assert uploaded == 0
+            assert earliest_success is None
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_already_synced_file_is_skipped(self):
+        last_sync = datetime.datetime(2024, 6, 5, tzinfo=datetime.timezone.utc)
+        items = [
+            _make_item("1", "old.pdf", "2024-06-01T00:00:00Z"),
+            _make_item("2", "also-old.pdf", "2024-06-05T00:00:00Z"),
+        ]
+
+        def content_get(url, headers, stream, timeout):
+            raise AssertionError("should not download an already-synced file")
+
+        patches = self._patch_common(items, content_get)
+        for p in patches:
+            p.start()
+        try:
+            blob_service_client = MagicMock()
+            uploaded, earliest_success = _upload_changed_files(
+                blob_service_client=blob_service_client,
+                container_name="ingest-output",
+                drive_id="drive-1",
+                site_id="site-1",
+                last_sync=last_sync,
+                headers={},
+            )
+            assert uploaded == 0
+            assert earliest_success is None
+        finally:
+            for p in patches:
+                p.stop()
+
+
+class TestRetry:
+    def test_succeeds_after_failures(self):
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise requests.exceptions.RequestException("boom")
+            return "ok"
+
+        with patch("function_app.time.sleep") as mock_sleep:
+            result = _retry(flaky, attempts=3, base_delay=1.0)
+
+        assert result == "ok"
+        assert calls["n"] == 3
+        assert mock_sleep.call_count == 2
+
+    def test_raises_after_exhausting_attempts(self):
+        def always_fails():
+            raise requests.exceptions.RequestException("boom")
+
+        with patch("function_app.time.sleep") as mock_sleep:
+            with pytest.raises(requests.exceptions.RequestException):
+                _retry(always_fails, attempts=3, base_delay=1.0)
+
+        assert mock_sleep.call_count == 2
+
+    def test_non_matching_exception_propagates_immediately(self):
+        calls = {"n": 0}
+
+        def fails_with_other_error():
+            calls["n"] += 1
+            raise ValueError("not retryable")
+
+        with patch("function_app.time.sleep") as mock_sleep:
+            with pytest.raises(ValueError):
+                _retry(fails_with_other_error, attempts=3, base_delay=1.0)
+
+        assert calls["n"] == 1
+        mock_sleep.assert_not_called()
+
+
+class TestDownloadAndUpload:
+    def test_happy_path_streams_chunks_into_upload_blob(self):
+        response = _make_streamed_response(chunks=[b"abc", b"def"])
+        blob_client = MagicMock()
+        with patch("function_app.requests.get", return_value=response) as mock_get:
+            _download_and_upload("http://example/content", {}, blob_client, {"k": "v"})
+
+        mock_get.assert_called_once_with(
+            "http://example/content", headers={}, stream=True, timeout=120
+        )
+        blob_client.upload_blob.assert_called_once()
+        args, kwargs = blob_client.upload_blob.call_args
+        assert list(args[0]) == [b"abc", b"def"]
+        assert kwargs["overwrite"] is True
+        assert kwargs["metadata"] == {"k": "v"}
+
+    def test_request_exception_propagates(self):
+        with patch("function_app.requests.get", side_effect=requests.exceptions.RequestException("boom")):
+            blob_client = MagicMock()
+            with pytest.raises(requests.exceptions.RequestException):
+                _download_and_upload("http://example/content", {}, blob_client, None)
