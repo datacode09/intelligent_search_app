@@ -473,7 +473,9 @@ This assumes someone has already created the Azure resources for this
 project (the storage account, the Function App itself, etc.) using the
 infrastructure template in `infra/main.bicep`. You're not creating
 anything new here — just configuring and deploying code to what already
-exists.
+exists. **If nobody has deployed the infrastructure yet and there's no
+CI/CD pipeline set up to do it, see [8.7](#87-manual-deployment--what-to-do-if-theres-no-cicd-pipeline-yet)
+below first, then come back here.**
 
 ### 8.1 Find your Function App in the Portal
 
@@ -564,6 +566,83 @@ If something doesn't look right, check the application logs:
 For a more thorough validation pass once you've gotten one successful run
 (checking permissions, large-file behavior, and more), see
 `E2E-CHECKLIST.md` in this same folder.
+
+### 8.7 Manual deployment — what to do if there's no CI/CD pipeline yet
+
+`azure-pipelines/ingest.yml` and `azure-pipelines/infra.yml` automate
+deployment through Azure DevOps (see `azure-pipelines/README.md` for how
+to set that up). If those pipelines aren't configured yet, or you just
+want to push out a one-off change without waiting for a pipeline run, you
+can do everything they do by hand from your own terminal. There are two
+separate things to deploy: the infrastructure (rarely) and the function
+code (every time you change `function_app.py`).
+
+#### 8.7.1 Deploying the infrastructure by hand (only needed once, or when `infra/main.bicep` changes)
+
+Skip this if someone already deployed the infrastructure — i.e. you found
+a resource group with a Function App already in it back in step 8.1.
+
+1. Make sure the Azure CLI is logged in and pointed at the right
+   subscription:
+   ```bash
+   az login
+   az account set --subscription "<your subscription name or ID>"
+   ```
+2. Create a resource group to hold everything, if one doesn't already
+   exist (pick any name and region):
+   ```bash
+   az group create --name hods-rg --location eastus
+   ```
+3. Deploy the Bicep template into it. This single command creates the
+   storage account, Key Vault, Function App, and everything else
+   `infra/main.bicep` defines — it's the same command
+   `azure-pipelines/infra.yml`'s Deploy stage runs:
+   ```bash
+   DEPLOYER_OID=$(az ad signed-in-user show --query id -o tsv)
+
+   az deployment group create \
+     --resource-group hods-rg \
+     --template-file infra/main.bicep \
+     --parameters prefix=hods \
+                  owner="<your name>" \
+                  deployerObjectId="$DEPLOYER_OID"
+   ```
+   - `prefix` controls the name of every resource it creates (e.g.
+     `hods-ingest-xxxxxxxx` for the Function App) — keep it short,
+     lowercase letters only.
+   - This takes a few minutes. When it finishes, it prints the names of
+     everything it created — note the Function App's name for step 8.1.
+4. Continue from [step 8.1](#81-find-your-function-app-in-the-portal)
+   above using the resource group you just created.
+
+> This template deploys more than just the ingest function — it's the
+> original full-stack template this standalone repo was trimmed from (see
+> `README.md`). The extra resources it creates (AI Search, Azure OpenAI,
+> API/UI hosting) aren't used by anything in this guide; you can ignore
+> them or delete them later if you don't need them.
+
+#### 8.7.2 Deploying the function code by hand (every time you change `function_app.py`)
+
+This is exactly what [step 8.3](#83-deploy-the-code) above already does —
+`func azure functionapp publish` *is* the manual deployment path, no
+CI/CD pipeline required. Run it any time after making a code change.
+
+If you don't have the Azure Functions Core Tools installed (step 5.3) and
+don't want to install them just for a one-off deploy, you can zip and
+deploy with the Azure CLI alone instead:
+
+```bash
+cd poc-hods-ingest
+zip -r ../ingest.zip . -x ".venv/*" ".azurite/*"   # Windows: use Compress-Archive instead of zip
+
+az functionapp deployment source config-zip \
+  --resource-group hods-rg \
+  --name <function-app-name> \
+  --src ../ingest.zip
+```
+
+Either method achieves the same result as the Deploy stage in
+`azure-pipelines/ingest.yml`.
 
 ## 9. Settings you might want to change
 
