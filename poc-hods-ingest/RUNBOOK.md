@@ -233,6 +233,12 @@ For more on how Azure's permission scopes work, how to grant (not just
 check) a role yourself, and how this differs from Entra ID and SharePoint
 permissions, see [Appendix B](#appendix-b-azure-portal-orientation-and-rbac-deep-dive).
 
+This section is about *your own* access. If instead you're trying to
+understand what permissions the **resources themselves** need on each
+other (e.g. "does the Function App have what it needs to read Key Vault,
+and how do I check that in the Portal"), see
+[Appendix C](#appendix-c-which-component-needs-which-permission).
+
 ## 5. Before you start (one-time setup)
 
 Do these steps once, in order. You can skip a step if you've already done
@@ -1146,3 +1152,67 @@ or performing the grant itself, if you're the one with **Owner** access:
 - Built-in roles (like all four in section 4.8) cover almost everything
   this project needs. Custom roles (hand-built combinations of specific
   permissions) exist for more advanced cases but aren't needed here.
+
+## Appendix C: Which component needs which permission
+
+Section 4.8 is about *your own* access. This appendix is different: if the
+platform team has already deployed all the resources and you're trying to
+audit or understand them, this is about what permissions the **resources
+themselves** — specifically the Function App's identity — need on *each
+other*, and how to actually find that in the Portal. This is the same
+ground section 11.4 checks for a specific symptom (a broken Key Vault
+reference); this appendix lays out the full picture component by
+component, and how to navigate to it from scratch.
+
+### C.1 How to navigate to a resource's permissions in the Portal
+
+Every Azure resource has its own **Access control (IAM)** blade, but there
+are two different things you can look at there, and it's easy to confuse
+them:
+
+1. **"Who can manage this resource"** — human/admin access (what section
+   4.8 and Appendix B.5 cover). Go to the resource → **Access control
+   (IAM)** → **Role assignments** tab. This lists every identity (people
+   *and* other resources) with a role on this resource, at any scope that
+   reaches it.
+2. **"What identity does this resource have, to act as, elsewhere"** —
+   this is what matters for this appendix. Go to the resource → **Identity**
+   in its left-hand menu (Function Apps, and most resource types that can
+   talk to other Azure services, have this). If **Status** is **On**
+   under the **System assigned** tab, this resource has its own automatic
+   login (a **managed identity** — see the glossary) that it uses to
+   authenticate to *other* resources, like Key Vault. The **Object
+   (principal) ID** shown there is what you'd look for in another
+   resource's role assignments list to confirm it has been granted access.
+
+**To check what a resource's managed identity is allowed to do elsewhere:**
+go to the *other* resource (e.g. the Key Vault, not the Function App) →
+**Access control (IAM)** → **Role assignments** tab → look through the
+list for a row whose assigned identity matches the Function App's name
+(Azure displays managed identities by their resource's name, not a raw
+GUID, in this list — which is more readable than the Object ID from step
+2 above). You can also filter this list: there's a **Type** column/filter
+where you can select **Managed Identity** to hide all the human accounts
+and just see what other resources have access.
+
+### C.2 Permission map for this project's components
+
+This reflects what `infra/main.bicep` actually deploys (not a general
+recommendation) — useful for confirming the platform team's deployment
+matches what's expected:
+
+| Component | Needs permission on | Role | Why | Where to verify |
+|---|---|---|---|---|
+| Function App's managed identity | Key Vault | **Key Vault Secrets User** | To resolve the `@Microsoft.KeyVault(SecretUri=...)` references for `AzureWebJobsStorage` / `BLOB_STORAGE_CONNECTION_STRING` (section 4.3) | Key Vault → Access control (IAM) → Role assignments → look for the Function App's name (`infra/main.bicep:261-266`) |
+| Function App's managed identity | Storage account | **None — not RBAC-based** | This project authenticates to Blob Storage with an **account key** embedded in the connection string (`infra/main.bicep:83`), not a role-based login. So you will *not* find the Function App listed under the storage account's role assignments — that's expected, not a misconfiguration | N/A — if you're trying to verify storage access works, check the Key Vault reference status instead (section 11.4), since that's what actually gates whether the connection string is readable |
+| Function App's managed identity | Microsoft Graph (SharePoint) | **Not Azure RBAC at all** | SharePoint access doesn't go through the Function App's managed identity — it uses the separate SharePoint service principal's (`SHAREPOINT_CLIENT_ID`) own Entra ID Graph application permission (Appendix B.4, item 2) | Entra ID → App registrations → the SharePoint app → API permissions |
+| You (a human operator) | Function App, resource group | **Reader** (to view) or **Contributor** (to change settings/redeploy) | Day-to-day operation (section 4.8) | Resource/resource group → Access control (IAM) → Check access |
+| You, if moving the SharePoint secret into Key Vault (section 4.4) | Key Vault | **Key Vault Secrets User** or **Key Vault Administrator** (to also create/manage secrets, not just read them) | Creating the `sharepoint-client-secret` entry | Key Vault → Access control (IAM) → Check access |
+
+**The short version, if you only remember one thing:** this project has
+exactly one cross-resource role assignment by design — the Function App
+reading from Key Vault. Everything else (storage, SharePoint) uses a key
+or a separate credential instead of an Azure RBAC role. If you're
+auditing what the platform team set up, confirming that one role
+assignment exists (C.1, method 2) is the single most important check —
+it's also covered as a failure symptom in section 11.4.
