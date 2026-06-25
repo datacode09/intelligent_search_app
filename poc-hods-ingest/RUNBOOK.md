@@ -1216,3 +1216,126 @@ or a separate credential instead of an Azure RBAC role. If you're
 auditing what the platform team set up, confirming that one role
 assignment exists (C.1, method 2) is the single most important check —
 it's also covered as a failure symptom in section 11.4.
+
+## Appendix D: A guided tour of the resource group
+
+Everything above is organized by *topic* (navigation, security,
+permissions). This appendix is organized by *resource* instead — a single
+walkthrough you can follow start to finish the first time you're handed
+someone else's Azure setup, going resource by resource and checking each
+one as you go. It links out to the fuller explanations elsewhere in this
+guide rather than repeating them.
+
+### D.0 Before you start the tour
+
+1. Go to [portal.azure.com](https://portal.azure.com) → search bar → type
+   the resource group's name (e.g. `hods-rg`; ask the platform team if you
+   don't know it) → click it.
+2. You'll land on the resource group's **Overview**, which lists every
+   resource inside it. The Portal sorts this list alphabetically by
+   default — that's not a useful order to inspect things in, since some
+   resources depend on others. Use this tour's order instead:
+   **Storage account → Key Vault → Function App → Application Insights →
+   Log Analytics workspace → App Service plan.**
+
+### D.1 Storage account
+
+- **What it's for:** holds the files this program copies from SharePoint,
+  plus its own bookkeeping data (glossary: **Azure Blob Storage**).
+- **How to get there:** resource group list → click the resource with
+  **Type = Storage account**.
+- **What to check:**
+  - **Containers** (left menu → **Data storage → Containers**) — does
+    `ingest-output` (or whatever `BLOB_CONTAINER_NAME` is set to) exist?
+  - Is it locked down correctly? See [section 11.5](#115-does-the-storage-account-look-locked-down)
+    for the exact settings to check (secure transfer, TLS version, public
+    access level).
+  - Remember: the Function App does **not** have an Azure RBAC role on
+    this resource — it authenticates with an account key instead (see
+    [Appendix C.2](#c2-permission-map-for-this-projects-components)). Don't
+    expect to find it under this resource's Access control (IAM).
+
+### D.2 Key Vault
+
+- **What it's for:** the locked safe holding the storage connection
+  string (and optionally the SharePoint client secret — see section 4.4)
+  so they don't sit in plain text (glossary: **Key Vault**).
+- **How to get there:** resource group list → click the resource with
+  **Type = Key Vault**.
+- **What to check:**
+  - **Objects → Secrets** — do the expected secrets exist (at minimum
+    `blob-storage-connection-string`)?
+  - **Access control (IAM) → Role assignments** — is the Function App
+    listed with the **Key Vault Secrets User** role? This is the one
+    cross-resource permission this whole project depends on — see
+    [Appendix C.1](#c1-how-to-navigate-to-a-resources-permissions-in-the-portal)
+    for exactly how to read this list.
+  - If you want to confirm the *connection itself* works (not just that
+    the role exists), do that check from the Function App side instead —
+    see [section 11.4](#114-is-the-key-vault-connection-actually-working-not-just-configured).
+
+### D.3 Function App
+
+- **What it's for:** runs this project's actual code on a schedule
+  (glossary: **Azure Function**, **Timer trigger**).
+- **How to get there:** resource group list → click the resource with
+  **Type = Function App**. **Watch out:** don't confuse this with a
+  similarly-named **Web App** resource — see
+  [step 8.1](#81-find-your-function-app-in-the-portal) for exactly how to
+  tell them apart (this is the most common wrong turn on this tour).
+- **What to check:**
+  - **Settings → Environment variables → App settings** — are the
+    SharePoint values filled in (not still `REPLACE_ME`)? See
+    [section 11.3](#113-are-the-sharepoint-settings-actually-filled-in).
+  - **Identity** (left menu) → **System assigned** tab → is **Status**
+    **On**? This is the managed identity that reads from Key Vault — see
+    [Appendix C.1](#c1-how-to-navigate-to-a-resources-permissions-in-the-portal).
+  - **Overview** → is it actually running, not stopped? See
+    [section 11.2](#112-is-the-function-app-actually-running).
+
+### D.4 Application Insights
+
+- **What it's for:** collects logs and performance data emitted while the
+  Function App runs, so you can see what happened after the fact instead
+  of only while watching a live terminal.
+- **How to get there:** resource group list → click the resource with
+  **Type = Application Insights**. (You can also reach the same data from
+  the Function App's own **Monitoring → Application Insights** menu item
+  — that's just a shortcut into this same resource.)
+- **What to check:**
+  - Are logs actually showing up? Run the `traces | take 10` query
+    described in [section 11.6](#116-are-logs-actually-flowing) to
+    confirm data is flowing, not just that the resource exists.
+
+### D.5 Log Analytics workspace
+
+- **What it's for:** the actual storage backing Application Insights —
+  Application Insights is the friendly front-end; this is where the log
+  data physically lives, queried with KQL (glossary-adjacent: see
+  **Configuration drift** and the KQL query in step 8.6 for an example).
+- **How to get there:** resource group list → click the resource with
+  **Type = Log Analytics workspace**.
+- **What to check:** for this project, you don't normally need to open
+  this resource directly — Application Insights (D.4) is the practical
+  entry point for the same data. It's worth knowing it exists so an empty
+  resource group scan doesn't surprise you, but there's no separate
+  development checklist for it here.
+
+### D.6 App Service plan
+
+- **What it's for:** the underlying compute capacity the Function App
+  runs on — think of it as "how much server" is allocated, separate from
+  the Function App resource itself, which is just the code/config layer
+  on top.
+- **How to get there:** resource group list → click the resource with
+  **Type = App Service plan**.
+- **What to check:** nothing project-specific — this project doesn't ask
+  you to change anything here. If the Function App (D.3) seems slow or
+  unresponsive in a way the other checks don't explain, this is where a
+  more experienced cloud engineer would look next (e.g. the plan's pricing
+  tier), but that's beyond what this guide covers.
+
+That's the full tour. If everything above checked out, the last remaining
+question is whether it actually *works* end to end — for that, there's no
+substitute for [section 11.8](#118-the-real-proof-does-it-actually-move-files)
+and the functional checklist in `E2E-CHECKLIST.md`.
