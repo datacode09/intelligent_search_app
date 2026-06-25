@@ -229,6 +229,10 @@ need it on. Tell them the exact role name and resource; "can you give me
 access" is harder for them to action than "can you give me **Contributor**
 on the `hods-rg` resource group."
 
+For more on how Azure's permission scopes work, how to grant (not just
+check) a role yourself, and how this differs from Entra ID and SharePoint
+permissions, see [Appendix B](#appendix-b-azure-portal-orientation-and-rbac-deep-dive).
+
 ## 5. Before you start (one-time setup)
 
 Do these steps once, in order. You can skip a step if you've already done
@@ -334,6 +338,11 @@ Either way, you end up needing five pieces of information:
 5. The SharePoint **site path** (for example `/sites/HODS`)
 
 Keep these somewhere safe — you'll paste them into a file in a moment.
+
+For more background on how a SharePoint site's URL maps to these values,
+what a "drive"/library actually is, and SharePoint's own permission levels
+(separate from the Entra ID app permission above), see
+[Appendix A](#appendix-a-sharepoint-orientation-and-permissions).
 
 ### 5.5 Open a terminal and set up the project
 
@@ -939,3 +948,201 @@ often, slow down."
 | `func start` says port 7071 is already in use | Some other program on your laptop is already using that port | Run `func start --port 7072` instead |
 | `ModuleNotFoundError` when running `func start` or `pytest` | Your virtual environment isn't activated, or you skipped `pip install -r requirements.txt` | Re-run the `source .venv/bin/activate` (or Windows equivalent) command from step 5.5, then re-run `pip install -r requirements.txt` |
 | The function runs but uploads 0 files, even though you know SharePoint has new files | The `last-sync` file already has a timestamp from a previous run that's newer than your test files | Delete the `last-sync` file from the storage container to force the program to copy everything again from scratch |
+
+## Appendix A: SharePoint orientation and permissions
+
+This appendix goes deeper than step 5.4 — read it if you want to
+understand *why* the SharePoint steps work the way they do, not just
+*what* to click.
+
+### A.1 Anatomy of a SharePoint site
+
+A SharePoint **tenant** is your organization's whole SharePoint
+environment — `https://hydroone.sharepoint.com` is an example of one. A
+**site** is one project/team space inside that tenant, identified by a
+**site path** like `/sites/HODS`. Put together, the full address of a
+site looks like:
+
+```
+https://hydroone.sharepoint.com/sites/HODS
+        \_________ hostname _________/\__ site path __/
+```
+
+This program needs the hostname and site path as two *separate* values
+(`SHAREPOINT_SITE_HOSTNAME` and `SHAREPOINT_SITE_PATH`) — the easiest way
+to get them right is to open the site in a browser, look at the address
+bar, and split the URL at the third `/` as shown above. Don't include
+`https://` in the hostname, and do include the leading `/` in the site
+path.
+
+Inside a site, a **document library** is a folder-like area for storing
+files (the default one is usually called "Documents," but sites often
+have more than one). Microsoft Graph (the API this program uses) calls a
+document library a **drive** — that's why the setting is named
+`SHAREPOINT_LIBRARY_DRIVE_NAME` instead of "library name." A library's
+*display name* (what you see in the SharePoint UI) and its *internal*
+name are sometimes different — if you get a "Drive not found" error
+despite the name looking right, check **Library Settings** (gear icon →
+**Library settings**, or **Settings** in the library's own toolbar) for
+the exact internal **Name** field.
+
+A **column** is a piece of metadata attached to each file in a library
+(e.g. "Department," "Document Type") — visible as extra fields/headers in
+the library's list view. This program can copy the value of *one* column
+per file into the uploaded blob's metadata, via
+`SHAREPOINT_METADATA_COLUMN` (step 5.4 mentions adding one if you're
+setting up a test site from scratch).
+
+### A.2 SharePoint permission levels, and how to check your own
+
+SharePoint has its own permission system, separate from both Entra ID and
+Azure RBAC (more on that distinction in Appendix B.4). The main levels,
+from least to most access, are:
+
+| Level | Can do |
+|---|---|
+| **Visitor** | View/download files only |
+| **Member** | View, upload, edit, delete files |
+| **Owner** | Everything Member can, plus manage the site's own permissions and settings |
+| **Site collection administrator** | Full control over the site and everything in it, set by a tenant admin |
+
+**To check your own level on a site:** click the gear icon (top right) →
+**Site permissions** (on some sites: **Site contents** → **Site
+settings** → **Site permissions**). It lists the groups you belong to and
+what level each has.
+
+**To check what level the service principal (SPN) app needs:** this
+project doesn't use a SharePoint-level permission at all for the app — it
+uses a Microsoft Graph **application permission** (`Sites.Read.All` or
+similar), granted in Entra ID and consented to by a tenant admin (step
+5.4's "Register the Entra ID app" steps). That's a different, broader
+mechanism: it lets the app read *any* site the permission covers, rather
+than being added as a "Visitor" to one specific site. If your
+organization's security policy requires the narrower, site-scoped version
+instead of tenant-wide `Sites.Read.All`, ask your Entra ID admin about
+Graph's site-scoped application permissions (sometimes set up via
+PowerShell or the SharePoint admin center) — this is the "more limited,
+site-specific permission" mentioned as an alternative in step 5.4 and
+again in section 4.6's "least privilege" note.
+
+### A.3 Common SharePoint-side errors
+
+These complement the Troubleshooting table above, which covers what the
+*program* reports — these are things you might see while clicking around
+the SharePoint site itself:
+
+| Symptom | Likely cause |
+|---|---|
+| "Sorry, this site hasn't been shared with you" when opening the site URL | Your own account doesn't have at least Visitor access to the site — ask a site Owner to add you (this only affects you browsing the site in a browser, not the app, which uses its own Entra ID credentials) |
+| Library Settings shows a different "Name" than what's in the page title/breadcrumb | The library was renamed after creation — SharePoint keeps the original internal name in some contexts. Use the **Name** field from Library Settings for `SHAREPOINT_LIBRARY_DRIVE_NAME` |
+| A column you added doesn't show up in uploaded blob metadata | Double-check `SHAREPOINT_METADATA_COLUMN` matches the column's *internal* name, which can differ from its display name if you renamed it after creating it (hover the column header → column settings to check) |
+
+## Appendix B: Azure Portal orientation and RBAC deep-dive
+
+### B.1 How the Portal is laid out
+
+When you open [portal.azure.com](https://portal.azure.com), four areas
+matter most:
+
+- **Search bar (top center)** — the fastest way to get anywhere. Type a
+  resource name, a resource type ("function app"), or a service name
+  ("key vault") and pick from the results. Faster than clicking through
+  menus.
+- **Subscription/directory switcher (top right)** — if your account has
+  access to more than one subscription or tenant, this controls which
+  one's resources you're currently seeing. If a resource you expect to see
+  isn't showing up anywhere, check this first.
+- **Left-hand resource menu** — once you're on a specific resource (a
+  Function App, a Storage account, etc.), this menu is specific to that
+  resource type. This is why a Function App's menu has **Functions** /
+  **Durable Functions** and a Storage account's menu has **Containers** /
+  **Access keys** — they're different menus for different resource types
+  (this is the same distinction used in step 8.1 to tell a Function App
+  apart from a Web App).
+- **Breadcrumb trail (top left of the main panel)** — shows where you are
+  (e.g. `hods-rg > az-func-hodsai-dev-cae-001 > Environment variables`).
+  Click any earlier part of it to jump back up a level instead of using
+  the browser's back button (which can sometimes lose your place in a
+  multi-step Portal form).
+
+### B.2 The resource hierarchy
+
+Azure organizes everything in a strict hierarchy, top to bottom:
+
+```
+Subscription          (billing boundary — "the account this is all under")
+  └─ Resource group    (a named folder grouping related resources)
+       └─ Resource      (the actual thing: a Function App, a Storage account, etc.)
+```
+
+For this project, everything lives in one resource group (commonly
+`hods-rg`) inside one subscription. Searching for the resource group
+first (as step 8.1 does) is usually faster than searching for an
+individual resource by name, especially if you don't remember its exact
+name.
+
+### B.3 Resource types you'll encounter in this project
+
+| Icon/name you'll see | What it is | Where it shows up in this guide |
+|---|---|---|
+| **Function App** | Runs this project's code | Steps 8.1–8.7 |
+| **Storage account** | Holds the uploaded files (and the Function App's own bookkeeping data) | Step 7, section 11.5 |
+| **Key Vault** | Stores secrets safely | Section 4.3–4.4, section 11.4 |
+| **App Service plan** | The underlying compute capacity the Function App runs on (you generally don't need to touch this directly) | Not directly referenced elsewhere in this guide |
+| **Application Insights** | Collects logs and telemetry from the Function App | Step 8.6 |
+| **Log Analytics workspace** | Stores the data Application Insights collects, queried with KQL | Step 8.6, section 11.6 |
+
+### B.4 Three separate permission systems — don't confuse them
+
+It's easy to assume "Azure permissions" is one system. It's actually
+three, managed in different places, and having access in one doesn't
+imply anything about the others:
+
+1. **Azure RBAC** (role assignments via **Access control (IAM)**) —
+   controls who can view/manage *Azure resources themselves*: Function
+   Apps, storage accounts, Key Vaults, etc. This is what section 4.8
+   covers.
+2. **Microsoft Entra ID permissions** — a separate system that controls
+   identity-related things: who can register apps, grant admin consent
+   for API permissions, manage users/groups. Being a Contributor on a
+   resource group (Azure RBAC) does **not** give you any Entra ID
+   permissions, and vice versa — they're unrelated grants. Step 5.4's "needs
+   Entra ID admin rights" callouts refer to this second system, not RBAC.
+3. **SharePoint permissions** (Appendix A.2) — controls who can access a
+   SharePoint *site's content* directly in a browser. Unrelated to both of
+   the above; the SPN app reading SharePoint via Graph application
+   permissions doesn't go through this system at all (see A.2).
+
+If you're stuck on a permission error, first identify *which* of these
+three systems it's coming from — the error message and where you
+encountered it usually makes this clear (an Azure Portal "Forbidden" on a
+resource page is #1; "admin consent required" in an app registration's API
+permissions page is #2; "this site hasn't been shared with you" in a
+browser is #3).
+
+### B.5 RBAC scope and how role assignments are actually granted
+
+Section 4.8 covered checking your *own* access. This is for understanding
+or performing the grant itself, if you're the one with **Owner** access:
+
+- Roles can be assigned at different **scopes**: management group,
+  subscription, resource group, or a single resource — in that order from
+  broadest to narrowest. A role assigned at a broader scope is
+  automatically inherited by everything underneath it (e.g. **Contributor**
+  on the `hods-rg` resource group applies to every resource inside it,
+  without assigning it individually to each one).
+- Prefer the narrowest scope that gets the job done — e.g. assign
+  **Key Vault Secrets User** on the one Key Vault someone needs, rather
+  than **Contributor** on the whole resource group, if reading one secret
+  is all they need to do.
+- **To grant a role** (requires **Owner**, or a role with
+  `Microsoft.Authorization/roleAssignments/write` permission, on the
+  scope in question): go to the resource/resource group/subscription →
+  **Access control (IAM)** → **+ Add** → **Add role assignment** → pick
+  the role from the list (use the search box — there are hundreds of
+  built-in roles, but this project only needs the four from section 4.8's
+  table) → **Members** tab → **+ Select members** → search for the
+  person's name or email → **Review + assign**.
+- Built-in roles (like all four in section 4.8) cover almost everything
+  this project needs. Custom roles (hand-built combinations of specific
+  permissions) exist for more advanced cases but aren't needed here.
