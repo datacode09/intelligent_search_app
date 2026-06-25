@@ -201,26 +201,47 @@ You should see something starting with `Python 3.13`. If you see a much
 older version, or "command not found," install Python 3.13 before
 continuing.
 
-### 5.2 Install Node.js
-
-This is needed later for the local storage emulator (Azurite — see the
-glossary above). Download it from
-[nodejs.org](https://nodejs.org/) (the "LTS" version is fine). To check:
-
-```bash
-node --version
-```
-
-Any version number printed back means it's installed.
-
-### 5.3 Install Azure Functions Core Tools
+### 5.2 Install Azure Functions Core Tools
 
 This is the program that actually runs the Azure Function on your laptop.
-It needs Node.js (from the previous step) to install:
+You do **not** need Node.js or npm to get it — install it directly:
+
+- **Windows:** run `winget install Microsoft.Azure.FunctionsCoreTools` in a
+  terminal, or download the MSI installer from
+  [the Core Tools releases page](https://github.com/Azure/azure-functions-core-tools/releases).
+- **macOS:** `brew tap azure/functions && brew install azure-functions-core-tools@4`
+- **Linux:** follow the apt instructions for your distro on
+  [Microsoft's Core Tools install page](https://learn.microsoft.com/en-us/azure/azure-functions/functions-run-local) —
+  it adds Microsoft's package repo, then `apt-get install azure-functions-core-tools-4`.
+
+To check it worked, open a new terminal and run:
 
 ```bash
-npm install -g azure-functions-core-tools@4
+func --version
 ```
+
+Any version number printed back means it's installed. (If you happen to
+already have Node.js installed for some other reason, `npm install -g
+azure-functions-core-tools@4` also works — but it's not required.)
+
+### 5.3 Install a local storage emulator (Azurite) — optional, only needed for Option A testing
+
+[Option A testing](#6-desktop-testing--option-a-fake-cloud-storage-do-this-first)
+in section 6 below uses Azurite (see the glossary) so you can test without
+touching real cloud storage. You can skip this step for now and come back
+to it when you reach section 6.
+
+The easiest way to get Azurite, since you already have VS Code installed,
+is the **Azurite VS Code extension** — no Node.js required:
+
+1. In VS Code, click the Extensions icon in the left sidebar (or press
+   `Ctrl+Shift+X` / `Cmd+Shift+X`).
+2. Search for **Azurite** (published by Microsoft) and click **Install**.
+
+Section 6 will tell you how to start it from VS Code when you get there.
+If you'd rather not use VS Code for this, two alternatives are covered in
+section 6 as well: running Azurite via Docker, or via `npx` (which does
+need Node.js).
 
 ### 5.4 Get your SharePoint credentials
 
@@ -351,23 +372,38 @@ storage):
 "BLOB_STORAGE_CONNECTION_STRING": "UseDevelopmentStorage=true",
 ```
 
-You'll need **two terminal windows open at the same time** for this step:
-one running the fake storage service, and one running the actual function.
+You'll need the fake storage service (Azurite) and the actual function
+running at the same time.
 
-**In your first terminal**, start Azurite (the fake storage service):
+**Start Azurite** using whichever way you set it up in step 5.3:
 
-```bash
-# macOS/Linux
-npx -y azurite --silent --location .azurite
-```
+- **VS Code extension (recommended):** open the Command Palette
+  (`Ctrl+Shift+P` / `Cmd+Shift+P`), type **Azurite: Start**, and press
+  Enter. It runs quietly in the background — look for "Azurite Blob
+  Service is successfully listening" in the bottom status bar or the
+  Output panel. No terminal window needed; skip ahead to starting the
+  function below.
+- **Docker (alternative):**
+  ```bash
+  docker run -p 10000:10000 -p 10001:10001 -p 10002:10002 mcr.microsoft.com/azure-storage/azurite
+  ```
+  Leave this terminal window open and running — closing it stops the fake
+  storage service.
+- **npx (alternative, needs Node.js):**
+  ```bash
+  # macOS/Linux
+  npx -y azurite --silent --location .azurite
+  ```
+  ```powershell
+  # Windows PowerShell
+  if (!(Test-Path .azurite)) { New-Item -ItemType Directory .azurite | Out-Null }; $env:NODE_OPTIONS=''; npx -y azurite --location .azurite --silent
+  ```
+  Leave this terminal window open and running — closing it stops the fake
+  storage service.
 
-```powershell
-# Windows PowerShell
-if (!(Test-Path .azurite)) { New-Item -ItemType Directory .azurite | Out-Null }; $env:NODE_OPTIONS=''; npx -y azurite --location .azurite --silent
-```
-
-Leave this terminal window open and running — closing it stops the fake
-storage service.
+If you used Docker or npx, you'll now need **a second terminal window**
+for the function itself (the VS Code extension path doesn't use up a
+terminal, so you can use your first one).
 
 **In a second terminal window**, move into the project folder, activate
 your virtual environment again (step 5.5), and start the function:
@@ -632,7 +668,7 @@ This is exactly what [step 8.3](#83-deploy-the-code) above already does —
 `func azure functionapp publish` *is* the manual deployment path, no
 CI/CD pipeline required. Run it any time after making a code change.
 
-If you don't have the Azure Functions Core Tools installed (step 5.3) and
+If you don't have the Azure Functions Core Tools installed (step 5.2) and
 don't want to install them just for a one-off deploy, you can zip and
 deploy with the Azure CLI alone instead:
 
@@ -672,8 +708,11 @@ as doing it once).
 This test starts its own temporary, throwaway copy of Azurite (separate
 from any Azurite you might already have running from section 6), runs the
 copy logic three times in a row using made-up SharePoint data, and checks
-that only the first run actually uploads anything. It needs Node.js
-(already installed in step 5.2) to start that temporary Azurite copy:
+that only the first run actually uploads anything. Unlike section 6,
+this specific test always needs Node.js — it starts its temporary Azurite
+copy via `npx` directly in the test code, regardless of which Azurite
+option (VS Code extension, Docker, or npx) you used for manual testing
+earlier:
 
 ```bash
 pytest tests/test_ingest_azurite_integration.py -v
