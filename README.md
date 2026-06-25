@@ -1,37 +1,37 @@
-# Intelligent Search App — HODS
+# poc-hods-ingest — SharePoint → Blob Ingestion
 
-A full-stack enterprise document search system powered by Azure AI Search, Azure OpenAI, and SharePoint.
+A standalone Azure Functions app that syncs files from a SharePoint
+document library into Azure Blob Storage on a timer.
 
-## Quick start
+## Where to look
 
-**Read [SETUP.md](SETUP.md) — it walks you through everything from zero to a running app.**
-
-## Components
-
-| Folder | What it is |
+| Doc | What's in it |
 |---|---|
-| [`poc-hods-ingest/`](poc-hods-ingest/) | Azure Function — syncs SharePoint documents to Azure Blob Storage every hour |
-| [`hydro-one-hods-api/`](hydro-one-hods-api/) | FastAPI backend — hybrid BM25 + semantic vector search with LLM query optimization |
-| [`hydro-one-hods-ui/`](hydro-one-hods-ui/) | React + Vite frontend — search UI with filters, AI query cleanup, and document highlights |
-| [`infra/`](infra/) | Bicep templates — deploys all Azure resources with one command |
-| [`scripts/`](scripts/) | Deployment and setup scripts |
-| [`azure-pipelines/`](azure-pipelines/) | Azure DevOps CI/CD pipelines for all four components |
+| [`poc-hods-ingest/README.md`](poc-hods-ingest/README.md) | Required settings (app settings / `local.settings.json`) and a description of the sync logic |
+| [`poc-hods-ingest/RUNBOOK.md`](poc-hods-ingest/RUNBOOK.md) | Step-by-step guide: one-time setup, desktop testing, and cloud (Azure) testing — written for someone with zero prior Azure experience |
+| [`poc-hods-ingest/E2E-CHECKLIST.md`](poc-hods-ingest/E2E-CHECKLIST.md) | Manual validation checklist for a deployed instance |
 
 ## Architecture
 
 ```
-SharePoint  →  [ingest Function]  →  Blob Storage  →  AI Search Index
-                                                              ↓
-                                                     [FastAPI backend]
-                                                              ↓
-                                                      [React frontend]
+SharePoint document library  →  [Ingest Azure Function]  →  Azure Blob Storage
 ```
 
-## One-command deploy
+The function wakes up on a timer (hourly by default), lists files in
+SharePoint changed since the last run, and uploads them to a blob
+container, tracking progress in a `last-sync` blob so re-runs only pick up
+new or changed files.
 
-```powershell
-az login
-.\scripts\deploy.ps1 -ResourceGroup "hods-rg" -Location "eastus"
-```
+## CI/CD
 
-See [SETUP.md](SETUP.md) for the full step-by-step guide.
+[`azure-pipelines/ingest.yml`](azure-pipelines/ingest.yml) lints, tests,
+and deploys this function. See
+[`azure-pipelines/README.md`](azure-pipelines/README.md) for setup.
+
+## Infrastructure
+
+[`infra/main.bicep`](infra/main.bicep) provisions this function's Azure
+resources (Storage, Key Vault, App Insights, Function App), alongside some
+resources for other parts of the original HODS project this repo was
+trimmed from — those are unused by this app and not covered by the docs
+above.

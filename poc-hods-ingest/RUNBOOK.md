@@ -112,12 +112,39 @@ npm install -g azure-functions-core-tools@4
 
 ### 5.4 Get your SharePoint credentials
 
-You cannot create these yourself unless you're an Entra ID administrator —
-ask whoever manages your organization's Entra ID/Azure setup for an "app
-registration" (service principal) with Microsoft Graph **application**
-permission `Sites.Read.All` (or a more limited, site-specific permission),
-with "admin consent" already granted on it. You will need five pieces of
-information from them:
+You need a SharePoint site with a document library to copy files from, and
+an Entra ID "app registration" (service principal) that's allowed to read
+it via Microsoft Graph. If someone has already set these up for you, skip
+to the bulleted list below. If you're setting this up from scratch (e.g. a
+test tenant) and have Entra ID admin access, here's the full path:
+
+**If you don't already have a SharePoint site to test against:**
+1. Get a free Microsoft 365 developer tenant at
+   [developer.microsoft.com/microsoft-365/dev-program](https://developer.microsoft.com/microsoft-365/dev-program)
+   (skip this if you already have access to a Microsoft 365 tenant).
+2. Go to `https://YOUR-TENANT.sharepoint.com`, click **+ Create site** →
+   **Team site**, and give it a name (e.g. `HODS Documents`). Note the site
+   URL — you'll need its hostname and path below.
+3. Click **Documents** in the left navigation, then **+ Add column** to
+   add any metadata columns you want copied to blob metadata later (this
+   project supports copying one column via `SHAREPOINT_METADATA_COLUMN`).
+4. Upload a few test files into the library.
+
+**Register the Entra ID app (needs Entra ID admin rights):**
+1. Go to [portal.azure.com](https://portal.azure.com) → search **App
+   registrations** → **New registration**. Name it anything (e.g.
+   `hods-ingest-app`), account type **Single tenant**, click **Register**.
+2. Copy the **Application (client) ID** → this is your `Client ID`.
+3. Copy the **Directory (tenant) ID** → this is your `Tenant ID`.
+4. Click **Certificates & secrets** → **New client secret** → give it a
+   description and expiry → **Add** → copy the **Value** immediately (it's
+   only shown once) → this is your `Client secret`.
+5. Click **API permissions** → **Add a permission** → **Microsoft Graph**
+   → **Application permissions** → search for and add `Sites.Read.All`
+   (or a more limited, site-specific permission).
+6. Click **Grant admin consent for [your org]** → **Yes**.
+
+Either way, you end up needing five pieces of information:
 
 1. The **Tenant ID**
 2. The **Client ID**
