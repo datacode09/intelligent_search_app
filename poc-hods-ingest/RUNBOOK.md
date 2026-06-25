@@ -182,6 +182,53 @@ the risk a different way instead of leaving it unaddressed:
   (`infra/main.bicep:35-36`) — don't disable that if you're customizing
   the infrastructure.
 
+### 4.7 Where to find secrets that already exist
+
+You won't always be creating a secret from scratch — often someone else
+set one up earlier, and you just need to find it. Here's where each one
+lives:
+
+| Secret | Where to find it |
+|---|---|
+| `SHAREPOINT_CLIENT_SECRET` (the SPN's client secret) | [Azure Portal](https://portal.azure.com) → **Entra ID** → **App registrations** → the app for this project → **Certificates & secrets**. **Important:** Azure never shows you an *existing* secret's value again after the moment it was created — you'll only see a masked value like `••••••••`. If you need the actual value and don't have it saved somewhere safe already, you can't "look it up" — you have to click **+ New client secret** to create a new one (and then delete the old one once you've updated the Function App setting, so there's only ever one valid secret at a time). |
+| `BLOB_STORAGE_CONNECTION_STRING` (real Azure storage account) | The **Storage account** resource → **Security + networking → Access keys** → click **Show** next to either key's connection string, then the copy icon. Unlike the SharePoint secret, this one *can* be viewed again later by anyone with the right permission (see 4.8 below) — Azure just hides it by default so it doesn't show up accidentally on a screen-share. |
+| Anything already stored in **Key Vault** (e.g. after following 4.4) | The **Key Vault** resource → **Objects → Secrets** → click the secret name → click its current version. There's a **Show secret value** button (you may need the **Key Vault Secrets User** role to use it — see 4.8). |
+| A value already typed into a Function App setting (e.g. checking what's currently in `SHAREPOINT_TENANT_ID`) | The **Function App** → **Settings → Environment variables** → **App settings** tab. Values are masked with `•••` by default; click the **eye icon** at the right of the row, or check the **Show values** toggle near the top of the table, to reveal them. |
+
+### 4.8 How to check whether you have permission to do something
+
+If a button is greyed out, or you get a red error banner mentioning
+"Forbidden," "AuthorizationFailed," or "does not have authorization,"
+that's Azure telling you your account hasn't been granted the role
+(see **Role assignment (RBAC)** in the glossary above) needed for that
+action — it's not a bug, and clicking around more won't fix it.
+
+**To see what you're currently allowed to do:**
+1. Go to the resource (or resource group, or subscription) you're trying
+   to act on in the Portal.
+2. Left-hand menu → **Access control (IAM)**.
+3. Click the **Check access** (or **View my access**) button near the
+   top of the page. It lists every role you've been assigned on that
+   resource — if the list is empty, you have no access to it at all.
+
+**Roles you're likely to need for this project, and what each lets you do:**
+
+| Role | Lets you... | Needed for |
+|---|---|---|
+| **Reader** | View resources and their (non-secret) settings, but not change anything | Browsing the Portal, following section 11's checks |
+| **Contributor** | Create, edit, and delete most resources (Function Apps, storage accounts, etc.), but not manage who else has access | Deploying infra (8.7.1), changing Function App settings (8.2), redeploying code (8.3/8.7.2) |
+| **Key Vault Secrets User** | Read (and with some Key Vault configurations, also list) secret *values* inside a specific Key Vault | Viewing/copying an existing secret from Key Vault (4.7), or completing the Key Vault migration in 4.4 |
+| **Owner** | Everything Contributor can do, plus managing role assignments for other people | Granting *other* people access — you generally don't need this one yourself |
+
+**If you don't have a role you need:** don't try to work around it (for
+example, by asking someone to share their own login). Instead, ask
+whoever manages access for your Azure subscription — often called the
+subscription or resource group **Owner** — to grant you the specific role
+from the table above, on the specific resource (or resource group) you
+need it on. Tell them the exact role name and resource; "can you give me
+access" is harder for them to action than "can you give me **Contributor**
+on the `hods-rg` resource group."
+
 ## 5. Before you start (one-time setup)
 
 Do these steps once, in order. You can skip a step if you've already done
