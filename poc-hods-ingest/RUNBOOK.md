@@ -58,17 +58,124 @@ A few terms come up a lot. Here's what they mean, in plain language:
 
 ## 4. Security — please read before going further
 
+This section is longer than you might expect for a "getting started" guide.
+That's deliberate: the single biggest risk in a project like this isn't a
+bug in the code, it's a secret (a password-like value) ending up somewhere
+it shouldn't — a chat message, a public repo, a screenshot. Read this
+before you create any credentials.
+
+### 4.1 What's a "secret" here, and which ones actually need protecting
+
+Three of the five SharePoint values from step 5.4 are secrets in different
+senses:
+
+| Value | How sensitive? | Why |
+|---|---|---|
+| `SHAREPOINT_CLIENT_SECRET` | **High — treat like a password** | Anyone who has it can log in as this app and read everything it has permission to read in SharePoint, for as long as the secret is valid. |
+| `SHAREPOINT_TENANT_ID`, `SHAREPOINT_CLIENT_ID` | Low | These just identify "which company" and "which app" — like a username, not a password. Seeing them alone doesn't let anyone log in. Still avoid posting them publicly for no reason, but a coworker seeing them in a screenshot isn't an incident. |
+| `BLOB_STORAGE_CONNECTION_STRING` (real Azure storage, not the local fake one) | **High — treat like a password** | Anyone who has it can read and write every file in that storage account. |
+
+### 4.2 Local secrets (desktop testing)
+
 - The file `local.settings.json` (you'll create it in the next section)
-  holds real secrets — your SharePoint app's password (client secret), and
-  possibly a real storage password (connection string). This file is set up
-  to never be saved into the project's shared history (git). **Never**
-  remove it from the `.gitignore` file, never paste its contents into any
-  other file in the project, and never share it over chat, email, or a
-  screenshot.
+  holds real secrets — your SharePoint app's client secret, and possibly a
+  real storage connection string. This file is set up to never be saved
+  into the project's shared history (git). **Never** remove it from the
+  `.gitignore` file, never paste its contents into any other file in the
+  project, and never share it over chat, email, or a screenshot.
 - If a client secret was ever shared over chat, email, or a screenshot,
   treat it as already compromised. Ask whoever manages Entra ID to create
   a new one for you (App registrations → your app → Certificates & secrets)
   before relying on the old one for anything beyond a quick, throwaway test.
+
+### 4.3 Cloud secrets — what this project already protects, and what it doesn't
+
+In the cloud (production) deployment, Azure has a dedicated service for
+storing secrets safely called **Key Vault** — think of it as a locked safe
+that other Azure resources can be given permission to read from, instead of
+secrets sitting in plain text everywhere. This project deploys one
+(`infra/main.bicep`).
+
+Here's the part that's easy to miss: **not every secret in this project
+actually uses it.**
+
+- `AzureWebJobsStorage` and `BLOB_STORAGE_CONNECTION_STRING` (the storage
+  connection string) **are** protected this way — in the Function App's
+  settings, their value is `@Microsoft.KeyVault(SecretUri=...)`, a
+  *reference* to the real value sitting safely in Key Vault, not the value
+  itself (see `infra/main.bicep:244-245`). The Function App's identity is
+  given permission to read from Key Vault (`infra/main.bicep:260-269`), but
+  no human ever needs to see the real value in plain text.
+- `SHAREPOINT_CLIENT_SECRET` **is not** — it's stored directly as a plain
+  Function App setting (`infra/main.bicep:251`). After you fill it in
+  (step 8.2), anyone with Reader access to the Function App in the Portal
+  can click into **Settings → Environment variables** and read it in plain
+  text. This is a known gap in the current setup, not something you did
+  wrong — but you should know about it.
+
+### 4.4 What to do about it — moving the SharePoint secret into Key Vault
+
+If you have permission to create resources in the Azure subscription (or
+can ask someone who does), it only takes a few minutes to close this gap:
+
+1. In the [Azure Portal](https://portal.azure.com), find the Key Vault for
+   this project — it's in the same resource group as the Function App,
+   named something like `hods-kv-xxxxxxxx`. Click it.
+2. In the left-hand menu, click **Objects → Secrets**, then
+   **+ Generate/Import**.
+3. **Name**: `sharepoint-client-secret`. **Value**: paste the real client
+   secret from step 5.4. Click **Create**.
+4. Click into the secret you just created, then click its current version.
+   Copy the **Secret Identifier** — a long URI starting with `https://`.
+5. Go to the Function App → **Settings → Environment variables**, find
+   `SHAREPOINT_CLIENT_SECRET`, and replace its value with:
+   `@Microsoft.KeyVault(SecretUri=<paste the URI from step 4 here>)`
+6. Click **Apply** / **Save** and confirm. No extra permission setup is
+   needed — the Function App's identity already has the **Key Vault
+   Secrets User** role on the whole vault (it was granted that to read the
+   storage secret), so it can read this new secret too.
+7. Trigger a run (step 8.4) and check the logs (step 8.6) to confirm it
+   still works.
+
+There's no need to do this for `SHAREPOINT_TENANT_ID` or
+`SHAREPOINT_CLIENT_ID` — per the sensitivity table above, they're
+identifiers, not passwords.
+
+### 4.5 If Key Vault genuinely isn't an option right now
+
+Maybe you don't have permission to create Key Vault secrets, or this is a
+short-lived test environment and it's not worth the setup. If so, reduce
+the risk a different way instead of leaving it unaddressed:
+
+- **Limit who can see the Function App's settings.** Ask whoever manages
+  Azure access (RBAC) to make sure only people who actually need it have
+  **Contributor** or **Reader** access to this Function App / resource
+  group — not "everyone in the team."
+- **Rotate the secret more often than you would a Key-Vault-protected
+  one** (e.g. every 30-60 days instead of the default expiry) — go to
+  Entra ID → App registrations → your app → Certificates & secrets → add a
+  new one, update the Function App setting, then delete the old one.
+- **Never copy the value anywhere else** — not into a chat message to ask
+  "is this right?", not into a ticket, not into a doc. If you need help
+  debugging, share the *error message*, not the secret.
+- Treat moving it into Key Vault as a follow-up task, not something to
+  forget about — it's a small amount of work for a real reduction in risk.
+
+### 4.6 A few more habits worth building now
+
+- **Least privilege on the Entra ID app.** When you register the app
+  (step 5.4), only grant the Graph permission it actually needs
+  (`Sites.Read.All`, or — better — a site-scoped permission if your Entra
+  ID admin supports it). Don't grant broader permissions "just in case."
+- **Never log secrets.** If you ever add a `logging.info(...)` or
+  `print(...)` line while debugging, double check it doesn't include
+  `client_secret`, a connection string, or a full request/response body
+  that might contain one. The existing code is careful about this — keep
+  it that way in anything you add.
+- **HTTPS only, always.** The storage account and Function App in this
+  project already enforce HTTPS-only traffic and a minimum TLS version
+  (`infra/main.bicep:35-36`) — don't disable that if you're customizing
+  the infrastructure.
 
 ## 5. Before you start (one-time setup)
 
