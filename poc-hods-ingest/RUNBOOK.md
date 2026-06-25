@@ -523,9 +523,28 @@ below first, then come back here.**
 1. Go to [portal.azure.com](https://portal.azure.com).
 2. In the search bar, search for the resource group for this project (ask
    whoever deployed the infrastructure for its name if you don't know it).
-3. Inside the resource group, look for a resource whose name contains
-   `ingest` and has the type "Function App" — that's the one you want.
-   Click it.
+3. Inside the resource group, you'll see a list of resources with
+   different **Type** values (Function App, App Service, Storage account,
+   Key Vault, etc.). Look for one whose **Type** column says "Function
+   App" — that's the one you want. As a naming hint, it often contains
+   `func` rather than `webapp` in its name (for example
+   `az-func-hodsai-dev-cae-001`, **not** `az-webapp-hodsai-dev-cae-001` —
+   the latter is a different resource, a plain web app, not this
+   project's ingest function). Click the Function App one.
+
+**How to confirm you clicked the right one** (the resource group list is
+easy to misread, so double-check once the resource page opens):
+- Near the top of the page, next to the resource's name, it should
+  explicitly say **"Function App"**.
+- In the left-hand menu, you should see **Functions** and **Durable
+  Functions** entries. These two only ever appear on Function Apps — a
+  regular Web App's left menu doesn't have them.
+
+If the page you're on doesn't show those two menu items (for example, it
+shows "Deployment Center" instead, with no "Functions" entry), you're on
+the wrong resource — go back to the resource group list and look again.
+Adding settings to the wrong resource won't do anything useful, since the
+ingest code isn't running there.
 
 ### 8.2 Fill in the SharePoint settings
 
