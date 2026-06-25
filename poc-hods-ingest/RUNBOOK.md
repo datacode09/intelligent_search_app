@@ -55,6 +55,11 @@ A few terms come up a lot. Here's what they mean, in plain language:
 | **Terminal / command line** | A text-based window where you type commands instead of clicking buttons. On Mac it's called "Terminal," on Windows it's "PowerShell" or "Command Prompt." |
 | **Virtual environment (venv)** | An isolated, private copy of Python just for this project, so installing things here doesn't affect any other Python project on your computer. |
 | **The Azure Portal** | The website (portal.azure.com) where you click around to view and manage your Azure resources. |
+| **Resource group** | A folder that groups all the Azure resources for one project together (the storage account, Key Vault, Function App, etc.), so you can find/manage/delete them as a set. |
+| **Key Vault** | Azure's locked-safe service for secrets. Instead of a password sitting in plain text somewhere, it sits in Key Vault, and other resources are individually given permission to read it. |
+| **Managed identity** | An automatic, built-in "login" that Azure gives to a resource like a Function App, so it can prove who it is to other Azure resources (like Key Vault) without anyone typing a password. |
+| **Role assignment (RBAC)** | A specific permission grant — "this identity is allowed to do this action on this resource." For example, the Function App's managed identity is given a role assignment that says "you may read secrets from this Key Vault." No role assignment means no access, even if everything else looks configured correctly. |
+| **Configuration drift** | When the real, live setup in Azure no longer matches what the infrastructure template (`infra/main.bicep`) says it should be — usually because someone changed a setting by hand in the Portal after the template was deployed. |
 
 ## 4. Security — please read before going further
 
@@ -676,6 +681,139 @@ pytest tests/test_ingest_azurite_integration.py -v
 
 If Node.js or `npx` isn't available, this test automatically skips itself
 instead of failing — so it's safe to ignore if it doesn't run.
+
+## 11. Someone else already set up the cloud infrastructure — how do you know it's actually correct?
+
+It's common to inherit an Azure setup someone (or some automated pipeline)
+already built, instead of building it yourself. "It's deployed" and "it's
+deployed *correctly*" are different things — a setup can look complete in
+the Portal while still being broken in a way that only shows up when the
+function actually tries to run. This section is a checklist for telling
+the difference, entirely by clicking around the Portal — no command line
+required (an optional command-line shortcut is included for each check, in
+case you're comfortable with one).
+
+Do these checks **in order** — each one tends to explain a failure in the
+next one, so working top to bottom is faster than jumping around.
+
+### 11.1 Do all the pieces exist?
+
+1. Go to [portal.azure.com](https://portal.azure.com) → **Resource
+   groups** → open the resource group for this project.
+2. You should see, among other things: a **Storage account**, a **Key
+   vault**, a **Function App**, an **Application Insights** resource, and
+   a **Log Analytics workspace**. If any of these are missing, the
+   deployment was incomplete — go back to
+   [8.7.1](#871-deploying-the-infrastructure-by-hand-only-needed-once-or-when-infrastructure-main-bicep-changes)
+   and re-run the deployment.
+
+### 11.2 Is the Function App actually running?
+
+1. Click the **Function App** resource.
+2. On its **Overview** page, check the **Status** field — it should say
+   `Running`. `Stopped` means nobody (or some cost-saving policy) turned
+   it off.
+3. In the left-hand menu, click **Functions**. You should see one named
+   `Ingest` in the list. If the list is empty, the infrastructure exists
+   but the code was never deployed — do
+   [step 8.3](#83-deploy-the-code).
+
+### 11.3 Are the SharePoint settings actually filled in?
+
+1. On the Function App's page, click **Settings → Environment variables**.
+2. Look through the list for any value still showing `REPLACE_ME` — that's
+   placeholder text left over from the infrastructure template, meaning
+   nobody completed [step 8.2](#82-fill-in-the-sharepoint-settings) yet.
+   If you see it, fill those values in now before continuing.
+
+### 11.4 Is the Key Vault connection actually working (not just configured)?
+
+This is the check most people skip, and the most common way a setup
+*looks* fine but silently fails. Recall from
+[section 4.3](#43-cloud-secrets--what-this-project-already-protects-and-what-it-doesnt)
+that `AzureWebJobsStorage` and `BLOB_STORAGE_CONNECTION_STRING` aren't
+plain values — they're references that point at a secret stored in Key
+Vault. A reference can be typed correctly and still fail to resolve if the
+Function App was never given permission to read that Key Vault.
+
+1. Still on **Environment variables**, find `BLOB_STORAGE_CONNECTION_STRING`.
+   Its **Source** column should say **Key Vault Reference**, and there
+   should be a small status icon next to it — hover over it.
+2. A green checkmark / "Resolved" means it's actually working. A red
+   warning icon / "Error" means the Function App can't read the secret —
+   almost always because of a missing permission grant, which you'll
+   check next.
+3. Click the **Key vault** resource (from section 11.1) → **Access
+   control (IAM)** → **Role assignments** tab.
+4. Look for a row where the **Role** is **Key Vault Secrets User** and
+   the assigned identity is the Function App itself (it'll be listed by
+   the Function App's name). If that row is missing, that's the bug —
+   the Function App's managed identity was never granted permission to
+   read from this vault, and every cold start will fail to start up
+   properly even though the app setting "looks" correct.
+
+> **Optional command-line shortcut**, if you have the Azure CLI installed
+> and logged in (`az login`):
+> ```bash
+> az rest --method get --uri "https://management.azure.com$(az functionapp show --name <function-app-name> --resource-group <rg> --query id -o tsv)/config/configreferences/appsettings?api-version=2022-03-01"
+> ```
+> Look for `"status": "Resolved"` next to each setting in the output.
+
+### 11.5 Does the storage account look locked down?
+
+1. Click the **Storage account** resource.
+2. Click **Settings → Configuration**. Confirm **Secure transfer
+   required** is **Enabled** and **Minimum TLS version** is **Version
+   1.2**. These should already be set this way by the infrastructure
+   template — if they're not, someone changed them by hand after
+   deployment.
+3. Click **Data storage → Containers** → `ingest-output`. Confirm
+   **Public access level** is **Private** — files in this container
+   should never be reachable by a plain public URL.
+
+### 11.6 Are logs actually flowing?
+
+A Function App can be "Running" with everything wired up and still have
+no working logging — which means when something does go wrong later,
+you'll have no way to see why.
+
+1. On the Function App's page, click **Application Insights** in the
+   left menu (or find the separate Application Insights resource from
+   section 11.1 directly).
+2. Click **Logs**, paste in `traces | take 10`, and click **Run**.
+3. If you see rows come back (even just routine startup messages), logs
+   are flowing correctly. If the query returns nothing at all — even
+   after the app has had time to run — something's disconnected between
+   the Function App and Application Insights, and you should fix that
+   before relying on logs to debug anything else.
+
+### 11.7 Optional, more advanced: has anyone changed things by hand since deployment?
+
+This check is for configuration drift (see the glossary in section 3) —
+it's useful but not required to confirm the basics above. It needs the
+Azure CLI:
+
+```bash
+az deployment group what-if \
+  --resource-group <resource-group> \
+  --template-file infra/main.bicep \
+  --parameters prefix=hods owner=<your-name> deployerObjectId=$(az ad signed-in-user show --query id -o tsv)
+```
+
+This compares what the infrastructure template says should exist against
+what's actually there, without changing anything. If it reports no
+differences, the live setup matches the template exactly. If it lists
+changes, someone modified something in the Portal directly after the
+template was last deployed — worth knowing about, since the next template
+deployment would undo that manual change.
+
+### 11.8 The real proof: does it actually move files?
+
+Everything above confirms the *plumbing* is connected correctly — none of
+it proves the SharePoint-to-Blob logic actually works. For that, do
+[steps 8.4 through 8.6](#84-trigger-a-run) (trigger a run, check the
+storage container, check the logs for errors), then work through the
+fuller functional checklist in `E2E-CHECKLIST.md` in this same folder.
 
 ## Troubleshooting
 
