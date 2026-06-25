@@ -313,8 +313,8 @@ First you need a connection string for a real storage account. In the
 [Azure Portal](https://portal.azure.com):
 
 1. In the search bar at the top, type the name of your storage account
-   (ask whoever set up the Azure resources if you don't know it — see
-   `README.md` for example naming) and click it.
+   (ask whoever set up the Azure resources if you don't know it) and click
+   it.
 2. In the left-hand menu, click **Access keys**.
 3. Click **Show** next to "Connection string," then click the copy icon.
 
