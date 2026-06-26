@@ -383,6 +383,24 @@ that container.
   target storage account — only if using Azure AD auth instead of a
   connection string.
 
+## Troubleshooting
+
+General failure patterns for any Function App, independent of this
+project's specific symptoms (for those, see `RUNBOOK.md`'s
+[Troubleshooting](RUNBOOK.md#troubleshooting) table instead).
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Function never runs, no error anywhere | Timer trigger's cron expression is wrong, or the Function App is stopped | Check **Overview** → is it "Running"? Check the trigger's schedule in `function_app.py` against actual time |
+| Code deploys successfully but old behavior still happens | Deployment succeeded but Azure is still serving from a cached/previous package, or you deployed to the wrong Function App | Restart the Function App after deploying; double-check the `<function-app-name>` you targeted matches the one you opened in the Portal |
+| `Authorization failed` / `Forbidden` errors in logs, but app settings look correct | Managed identity exists but was never granted a role (Step 5) | Check the Key Vault's or storage account's **Access control (IAM)** → look for the Function App's name in role assignments. If missing, it needs Key Vault Secrets User / Storage Blob Data role |
+| A setting shows as a literal `@Microsoft.KeyVault(...)` string instead of resolving | The Key Vault reference's URI is wrong, the secret doesn't exist, or the identity lacks Key Vault Secrets User | Open the setting in the Portal — it'll show a status icon (resolved/error) you can hover for the exact reason |
+| App settings table is empty / greyed out with a permissions banner | You only have Reader (or similar) on the Function App | You need Contributor — ask whoever manages your role assignments |
+| Function runs but throws `KeyError` / `None` errors reading a setting | The setting name in `function_app.py` doesn't exactly match the name in Application settings (case-sensitive) | Compare the exact string in `os.getenv("...")` against the Portal's Configuration list |
+| Works locally, fails only in Azure | A value in `local.settings.json` was never replicated as an Application setting in Azure — `local.settings.json` is local-only and is **never** read in the cloud, even if accidentally deployed | Set the same key/value (or Key Vault reference) under the Function App's Configuration in the Portal |
+| Cold start takes 10-30+ seconds before first run | Normal behavior on a Consumption plan after idle time | Expected; switch to Premium plan if this is a problem (e.g. for HTTP-triggered functions with strict latency needs — usually irrelevant for a timer job) |
+| Function App deploys but `Functions` blade shows zero functions | `function_app.py` has a syntax error, or `host.json`/`requirements.txt` issues prevented the runtime from indexing it | Check **Deployment Center** → **Logs**, or `Application Insights` → `traces` for a startup/indexing error |
+
 ## Common pitfalls
 
 - **Forgetting Step 5.** The Function App deploys fine, app settings look
