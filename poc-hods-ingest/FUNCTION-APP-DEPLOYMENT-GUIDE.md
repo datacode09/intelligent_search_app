@@ -446,6 +446,58 @@ connect to and what to do — deploying code never changes those settings.
 
 - **Permission needed:** Contributor on the Function App.
 
+### What actually lands in the target container
+
+Before testing, it helps to know exactly what to expect in the container
+once a run succeeds — both this project's specific behavior and the
+general blob concept of "metadata" that makes it possible.
+
+**Blob metadata, conceptually:** every blob in Azure Storage can carry an
+optional set of key/value string pairs alongside its content — separate
+from the file's bytes, viewable in the Portal under the blob's
+**Properties → Metadata** without downloading the file. It's meant for
+small descriptive tags (a few dozen short strings), not large data.
+Metadata is set at upload time via the `metadata=` argument on
+`upload_blob(...)` — this project's `_download_and_upload()` helper
+(`function_app.py:28-35`) does exactly that for every file it writes.
+
+**For each file this pipeline uploads, three metadata keys are set**
+(`function_app.py:346-380`):
+
+| Metadata key | Where it comes from | Notes |
+|---|---|---|
+| `Modified` | The file's `lastModifiedDateTime` from SharePoint/Graph | Always set |
+| `Prefix` | The SharePoint list item's `Prefix` lookup column, resolved to its human-readable display value | Set only if the lookup resolves; a warning is logged if it can't be found |
+| `ContentType` | The SharePoint list item's `HODSContentType` column (a multi-value lookup, serialized as a JSON array string) | Set only if the field exists on the item |
+
+A few behaviors worth knowing when you're checking the container by hand:
+- **Blob names are sanitized**, not a 1:1 copy of the SharePoint file name
+  — `_to_blob_name()` (`function_app.py:158-164`) strips characters outside
+  `[0-9A-Za-z._-]`, collapses repeated underscores, and trims leading/
+  trailing separators. So `My Report (Final).pdf` might land as
+  `My_Report_Final.pdf` — don't be surprised if a name doesn't match
+  exactly.
+- **Metadata values are ASCII-only** — `_to_blob_metadata_value()`
+  (`function_app.py:167-189`) strips any non-ASCII characters, since Azure
+  Blob metadata values are required to be ASCII. Accented characters or
+  non-Latin text in a SharePoint field will be silently dropped from the
+  metadata value (the file content itself is unaffected — only the
+  metadata tag).
+- **Re-uploads overwrite, not duplicate** — `upload_blob(..., overwrite=True)`
+  means if the same file is modified in SharePoint and picked up again on
+  a later run, it replaces the existing blob (same name) rather than
+  creating a second copy.
+- **One extra control blob, not your data:** alongside your actual files,
+  the container also holds a blob literally named `last-sync` —
+  (`function_app.py:504-505`), a plain text timestamp the pipeline reads
+  on its next run to know where it left off. It's not one of your ingested
+  files; don't delete it unless you intend to force the next run to
+  re-scan everything from the beginning.
+
+To inspect any of this yourself: Storage account → Containers →
+`ingest-output` → click a blob → **Properties** tab shows its metadata
+key/value pairs directly in the Portal.
+
 ### Step 8 — Create the target container and test
 
 In the target storage account, create the blob container your code will
