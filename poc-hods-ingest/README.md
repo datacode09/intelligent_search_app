@@ -22,6 +22,7 @@ Settings / Environment variables / App settings.
 | BLOB_METADATA_KEY | Name of the blob metadata key to hold the SharePoint column value. If not provided, the SHAREPOINT_METADATA_COLUMN name will be used | Yes |
 | INGEST_SCHEDULE_CRON | NCronTab expression for the timer trigger. Defaults to `0 0 * * * *` (top of every hour). Use a tighter value like `0 */2 * * * *` only for short local test runs — running every minute against real SharePoint will hit MS Graph throttling (HTTP 429). | Yes |
 | INGEST_MAX_FILES_PER_RUN | Max number of changed files uploaded in a single run. Defaults to 500. Lower this (e.g. 10) for a quick local smoke test. | Yes |
+| INGEST_START_DATE | ISO-8601 timestamp (e.g. 2024-01-01T00:00:00Z). Only used on the very first run, before a last-sync blob exists — sets the starting point so a fresh deployment doesn't ingest every file ever modified. Defaults to the Unix epoch (ingests everything) if unset. No effect once a last-sync blob exists. | No |
 
 ## Description
 

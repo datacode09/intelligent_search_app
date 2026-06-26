@@ -35,13 +35,19 @@ def _download_and_upload(content_url, headers, blob_client, metadata):
         )
 
 
-def _parse_last_sync(last_sync_raw: Optional[str]) -> datetime.datetime:
+_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+
+
+def _parse_last_sync(last_sync_raw: Optional[str], default: Optional[datetime.datetime] = None) -> datetime.datetime:
+    if default is None:
+        default = _EPOCH
+
     if not last_sync_raw:
-        return datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+        return default
 
     raw_value = last_sync_raw.strip()
     if not raw_value:
-        return datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+        return default
 
     # Support the previous format and ISO-8601 values for backward compatibility.
     formats = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ"]
@@ -61,8 +67,8 @@ def _parse_last_sync(last_sync_raw: Optional[str]) -> datetime.datetime:
             parsed = parsed.replace(tzinfo=datetime.timezone.utc)
         return parsed.astimezone(datetime.timezone.utc)
     except ValueError:
-        logging.warning("Unrecognized last-sync format '%s'; defaulting to epoch", raw_value)
-        return datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+        logging.warning("Unrecognized last-sync format '%s'; defaulting to %s", raw_value, default.isoformat())
+        return default
 
 
 def _get_graph_token(tenant_id: str, client_id: str, client_secret: str) -> str:
@@ -465,7 +471,12 @@ def Ingest(myTimer: func.TimerRequest) -> None:
     except Exception:
         logging.info("No last-sync blob found, this may be the first run")
 
-    last_sync = _parse_last_sync(last_sync_raw)
+    # If this is the first run (no last-sync blob yet), start from
+    # INGEST_START_DATE instead of the Unix epoch, so a fresh deployment
+    # doesn't try to ingest every file ever modified in the source.
+    start_date_raw = os.getenv("INGEST_START_DATE")
+    default_start = _parse_last_sync(start_date_raw) if start_date_raw else _EPOCH
+    last_sync = _parse_last_sync(last_sync_raw, default=default_start)
     logging.info("Using last-sync timestamp (UTC): %s", last_sync.isoformat())
 
     try:

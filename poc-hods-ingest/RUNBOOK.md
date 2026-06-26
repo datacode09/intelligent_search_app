@@ -777,6 +777,7 @@ settings in step 8.2.
 |---|---|---|
 | `INGEST_SCHEDULE_CRON` | `0 0 * * * *` (once an hour) | How often the timer fires. You can shorten this for a quick local test (e.g. every 2 minutes), but never use a short schedule against real SharePoint/production data — Microsoft Graph will start rejecting requests (see the `429` row in Troubleshooting) if you call it too often. |
 | `INGEST_MAX_FILES_PER_RUN` | `500` | The most files copied in one run. Lower this (e.g. to `10`) to do a quick test against a SharePoint library with lots of files, without waiting for everything to copy. |
+| `INGEST_START_DATE` | unset (epoch — `1970-01-01`) | Only matters on the very first run, before any `last-sync` blob exists. Set this to an ISO-8601 timestamp (e.g. `2024-01-01T00:00:00Z`) to skip ingesting everything modified before that date. Without it, a brand-new deployment will try to pull every file ever modified in the source library on its first run. Has no effect once a `last-sync` blob already exists — see Appendix E for the manual alternative if you need to change the starting point after the fact. |
 
 ## 10. Optional: running the deeper automated test
 
@@ -1339,3 +1340,64 @@ That's the full tour. If everything above checked out, the last remaining
 question is whether it actually *works* end to end — for that, there's no
 substitute for [section 11.8](#118-the-real-proof-does-it-actually-move-files)
 and the functional checklist in `E2E-CHECKLIST.md`.
+
+## Appendix E: Controlling where ingestion starts (avoiding a massive first run)
+
+This pipeline tracks progress with a single timestamp, stored in a blob
+named `last-sync` in the output container (see step 6 / step 8.5). On
+every run, it asks SharePoint for files modified after that timestamp. If
+that blob doesn't exist yet (a brand-new deployment, or one you've reset),
+it has nothing to compare against — so by default it falls back to the
+Unix epoch (`1970-01-01`), meaning the very first run tries to pull
+*every* file ever modified in the source library. For a large library,
+that's a slow first run and a lot of unnecessary data movement.
+
+### E.1 The configuration option — `INGEST_START_DATE`
+
+Set this app setting (see section 9's table) to an ISO-8601 timestamp,
+e.g. `2024-01-01T00:00:00Z`, and a fresh deployment's first run will only
+ingest files modified on or after that date, instead of everything since
+1970. This only matters before the first `last-sync` blob is written —
+once that blob exists, its value takes over completely and
+`INGEST_START_DATE` is no longer consulted (so it's safe to leave this
+setting in place indefinitely; it's a no-op after the first successful
+run).
+
+This is the easiest option if you're setting things up for the first time
+and already know you don't care about anything older than a certain date.
+
+### E.2 The manual alternative — seed the `last-sync` blob directly
+
+If you want to change the starting point *after* a `last-sync` blob
+already exists (e.g. you want to skip ahead, or force a re-ingest from a
+specific date without waiting for `INGEST_START_DATE` to matter), you can
+edit the value Azure is actually reading, with no app setting and no
+redeploy needed:
+
+1. Go to the storage account → **Containers** → `ingest-output`.
+2. Find the blob named `last-sync` (if it doesn't exist yet, this is the
+   same technique as a one-time manual seed before the first run, instead
+   of using `INGEST_START_DATE`).
+3. Click it → **Edit** (or upload a new blob with the same name,
+   overwriting it) → set its content to an ISO-8601 timestamp, e.g.
+   `2024-06-01T00:00:00Z`.
+4. Save. The next run will treat that value exactly as if it had been
+   written by a previous successful run — it'll only ingest files
+   modified after that date.
+
+**To force a full re-ingest of everything again** (the opposite problem —
+see the Troubleshooting table's "uploads 0 files" row), delete the
+`last-sync` blob entirely rather than editing it; the next run falls back
+to `INGEST_START_DATE` if set, or the epoch otherwise.
+
+### E.3 Which one should you use?
+
+- **Setting up for the first time, know your cutoff date in advance:**
+  use `INGEST_START_DATE` — it's a one-time config change, no manual blob
+  editing.
+- **Already running, need to adjust after the fact:** edit the `last-sync`
+  blob directly (E.2) — `INGEST_START_DATE` won't help here since it's
+  ignored once `last-sync` exists.
+- **Testing, want a clean-slate re-ingest:** delete the `last-sync` blob
+  (covered in the Troubleshooting table) rather than editing either
+  setting.

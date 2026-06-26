@@ -493,6 +493,13 @@ A few behaviors worth knowing when you're checking the container by hand:
   on its next run to know where it left off. It's not one of your ingested
   files; don't delete it unless you intend to force the next run to
   re-scan everything from the beginning.
+- **Avoiding a massive first run:** since the very first run has no
+  `last-sync` blob to compare against, it defaults to ingesting everything
+  modified since 1970. Set the `INGEST_START_DATE` app setting (an
+  ISO-8601 timestamp) before that first run to skip anything older than a
+  chosen date — see `RUNBOOK.md` Appendix E for this and the manual
+  alternative (editing the `last-sync` blob directly) if you need to
+  adjust the starting point after the fact.
 
 To inspect any of this yourself: Storage account → Containers →
 `ingest-output` → click a blob → **Properties** tab shows its metadata

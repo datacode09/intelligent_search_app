@@ -50,6 +50,23 @@ class TestParseLastSync:
         result = _parse_last_sync("not-a-date")
         assert result == datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 
+    def test_none_returns_custom_default(self):
+        custom_default = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        assert _parse_last_sync(None, default=custom_default) == custom_default
+
+    def test_empty_string_returns_custom_default(self):
+        custom_default = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        assert _parse_last_sync("", default=custom_default) == custom_default
+
+    def test_unrecognized_returns_custom_default(self):
+        custom_default = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        assert _parse_last_sync("not-a-date", default=custom_default) == custom_default
+
+    def test_valid_value_ignores_default(self):
+        custom_default = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        result = _parse_last_sync("2024-06-01T12:00:00Z", default=custom_default)
+        assert result.year == 2024 and result.month == 6 and result.day == 1
+
 
 class TestToBlobName:
     def test_simple_name(self):
