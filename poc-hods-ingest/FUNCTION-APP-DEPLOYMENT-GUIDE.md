@@ -459,6 +459,89 @@ that container.
   if you're authenticating with your own Azure AD account instead of the
   account key.
 
+## Repeated delete and redeploy (iterating during development)
+
+While developing, you'll often want to tear something down and rebuild it
+— either just the code, or the whole app. These are very different in
+cost and risk; know which one you actually need before running anything.
+
+### If you just changed your code — don't delete anything
+
+This is the common case and needs no deletion at all. Just re-run the same
+deploy command from Step 7 again:
+```bash
+func azure functionapp publish <function-app-name> --python
+```
+Each run overwrites the previous deployment package in place. The
+Function App, its settings, its managed identity, and its role grants are
+all untouched — only the code changes. Do this as many times as you want;
+there's no cleanup needed between runs.
+
+### If you want to reset the Function App itself (settings, identity, etc.)
+
+Sometimes you want a genuinely clean slate — e.g., app settings have
+accumulated cruft, or you suspect the managed identity/role grants are in
+a bad state and want to redo them from scratch.
+
+```bash
+az functionapp delete --name <function-app-name> --resource-group <rg>
+```
+
+**What this loses, that you'll have to redo:**
+- All Application settings (Step 6) — gone, not recoverable.
+- The managed identity (Step 4) — a new Function App gets a *new* identity
+  with a different object ID, even if you reuse the same name.
+- Every role grant made to that identity (Step 5) — those grants pointed
+  at the old identity's object ID, which no longer exists. You must
+  re-grant Key Vault Secrets User / Storage Blob Data roles to the new
+  identity after recreating.
+
+**What this does NOT touch:** the storage account, Key Vault, and App
+Service plan all survive — only the Function App resource itself is
+deleted. Recreate it (Step 3), then redo Steps 4-7.
+
+### If you're redeploying via the Bicep template (this project's pattern)
+
+Re-running the same deployment command is the normal way to apply
+infrastructure changes — it's **idempotent**, not destructive:
+```bash
+az deployment group create \
+  --resource-group <rg> \
+  --template-file infra/main.bicep \
+  --parameters prefix=hods owner="<your name>" deployerObjectId="$DEPLOYER_OID"
+```
+Azure compares the template against what already exists and only changes
+what's different — it does **not** delete and recreate everything from
+scratch, and existing app settings/role assignments defined in the
+template are reapplied, not duplicated. This is the safe way to "redeploy
+the app" repeatedly without manually deleting anything first.
+
+**Only delete resources by hand first if** you specifically want to force
+a clean recreate (e.g., you manually changed something out-of-band that
+Bicep won't overwrite back to its template state on its own). Even then,
+prefer deleting the *one* resource that's wrong rather than the whole
+resource group.
+
+### Gotchas specific to delete-and-recreate
+
+- **Storage account names are globally unique across all of Azure**, not
+  just your subscription. If you delete one and immediately try to
+  recreate it with the exact same name, you may briefly hit a "name
+  already in use" error while Azure finishes releasing it — wait a few
+  minutes and retry, or use a different name.
+- **Key Vaults have soft-delete on by default** (typically a 90-day
+  retention). Deleting a Key Vault doesn't free up its name immediately —
+  recreating with the same name will fail with a conflict unless you
+  either recover the soft-deleted vault (`az keyvault recover`) or purge it
+  first (`az keyvault purge` — only if you're certain you don't need
+  anything in it, and only if purge protection isn't enabled, in which
+  case purging isn't even possible until the retention period passes).
+- **Never delete the whole resource group as a shortcut** unless you
+  intend to lose *everything* in it, including resources unrelated to this
+  app that might be sharing the group (check the resource list first —
+  see Appendix D in `RUNBOOK.md` for a guided tour of what's likely in
+  there).
+
 ## Summary — who needs what
 
 **You, the human doing the deployment:**
