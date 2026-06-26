@@ -9,6 +9,73 @@ is for understanding the *why* behind each step and what permission you
 need at each point — useful if you ever have to build one from scratch, or
 just want to understand what already exists.
 
+## Meeting checklist — what to confirm with your platform engineer
+
+Use this as a literal walk-through during the meeting. For each item,
+either get a yes/name from them, or flag it as missing/TBD. It's ordered
+so that earlier items unblock later ones — don't skip ahead.
+
+**1. Resources that must exist**
+- [ ] One **Function App** (kind = Function App, not a Web App — confirm
+  by asking "does it have a Functions blade?")
+- [ ] One **hosting plan** behind it (Consumption is fine for a
+  timer-triggered job — ask which tier they used)
+- [ ] One **storage account** wired in as `AzureWebJobsStorage` (this can
+  double as your target storage — see "How many storage accounts" below;
+  you do not need them to provision a second one for this app)
+- [ ] One **Key Vault** (if any secrets — e.g. a source-system client
+  secret — are meant to be stored there rather than as plain app settings)
+- [ ] Application Insights (ask them to confirm it's linked — this is your
+  only window into logs once it's running)
+
+**2. Identity and permissions on the Function App**
+- [ ] **System-assigned managed identity** is turned on (Function App →
+  Identity blade → Status: On)
+- [ ] That identity has been granted **Key Vault Secrets User** on the Key
+  Vault, if you're using Key Vault references for any secret
+- [ ] That identity has been granted whatever role it needs on the target
+  storage account, *if and only if* you're using Azure AD auth for blob
+  access instead of a connection string (most simple setups use a
+  connection string instead — confirm which one applies here)
+
+**3. Access for you, the developer**
+- [ ] You have **Contributor** on the Function App itself (minimum to view
+  /edit app settings, redeploy code, trigger test runs)
+- [ ] You have **Contributor** on the storage account that backs this app
+  (lets you browse the container via the Portal's Storage Browser)
+- [ ] You have **Key Vault Secrets User** on the Key Vault, if you'll ever
+  need to read a secret value yourself (e.g. to confirm which storage
+  account a connection string points to)
+- [ ] Ask **how** these will be granted — directly to your account, or by
+  adding you to a group. If it's a group, ask which one, so you know who
+  else effectively shares this access.
+
+**4. App settings — get the exact list**
+- [ ] Ask for the full list of app setting *names* your code will read
+  (you likely already know these from your own code — bring the list,
+  don't make them guess)
+- [ ] For each one, confirm: is it a Key Vault reference or a plain value?
+- [ ] For any that are still placeholders (e.g. `REPLACE_ME`), confirm who
+  fills in the real value — you, or them — and get that done in the
+  meeting if possible, since a function with placeholder secrets will run
+  but fail silently or error out.
+
+**5. Deployment path — agree on one**
+- [ ] Ask how code is expected to reach this Function App: a CI/CD
+  pipeline they already have wired up, or manual deploy
+  (`func azure functionapp publish` / zip deploy) from your machine. If a
+  pipeline exists, get its name/location so you're not duplicating it by
+  deploying manually on top.
+
+**6. Before you leave the meeting**
+- [ ] You can name the exact Function App, storage account, and Key Vault
+  (not "one of the several in the resource group" — the *specific* ones)
+- [ ] You know what role you currently have vs. what you still need, and
+  who (if not them directly) needs to action any remaining grant
+- [ ] You have a way to test end-to-end afterward without needing them
+  again (e.g., you can trigger the function and check the output
+  container yourself)
+
 ## How an Azure Function App actually works
 
 Before the deployment steps below, it helps to understand what a Function
