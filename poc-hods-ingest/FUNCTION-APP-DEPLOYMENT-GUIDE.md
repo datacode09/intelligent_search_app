@@ -335,22 +335,114 @@ Add whatever configuration your code needs: connection strings, container
 names, source-system identifiers, etc. Stored under the Function App's
 **Configuration → Application settings**.
 
-Two patterns for secrets specifically:
-- **Key Vault reference** — the setting's value looks like
-  `@Microsoft.KeyVault(SecretUri=...)`. Azure resolves it automatically at
-  runtime using the managed identity from Step 4/5. The actual secret value
-  never appears in the Function App's settings — only a pointer to it.
-- **Plain value** — the setting just holds the literal value (e.g., a raw
-  connection string). Simpler, but the secret is now visible to anyone with
-  read access to the Function App's configuration, not just Key Vault.
+For secrets specifically (API keys, client secrets, connection strings),
+see "Handling secrets: with and without Key Vault" below for the two
+patterns and how to choose between them.
 
 - **Permission needed:** Contributor on the Function App.
 
+## Handling secrets: with and without Key Vault
+
+Any setting that's sensitive (a client secret, an account key, a
+connection string) can be stored two ways. Both work — the difference is
+where the secret value actually lives and who can see it.
+
+### Without Key Vault — plain app setting
+
+You put the literal secret value directly into the Function App's
+Application setting:
+
+```
+SHAREPOINT_CLIENT_SECRET = <the actual secret value>
+```
+
+- **Pros:** Simplest possible setup — no extra resource, no extra role
+  grant, works the moment you save it.
+- **Cons:** The raw value is visible to anyone with read access to the
+  Function App's Configuration blade (which is a lower bar than Key Vault
+  access — e.g. Contributor on the Function App is enough, no separate
+  Key Vault role needed). It also shows up in plaintext if the app
+  settings are ever exported (ARM template export, `az functionapp config
+  appsettings list`, etc.).
+- **When this is fine:** local development (`local.settings.json`, which
+  is gitignored and never leaves your machine), throwaway test
+  environments, or low-sensitivity values that aren't really secrets in
+  practice.
+- **When to avoid it:** production secrets, anything subject to
+  compliance/audit requirements, or any value you'd be unhappy to see
+  show up in a screenshot, log export, or ARM template dump.
+
+### With Key Vault — secret reference
+
+1. Store the actual secret as a **Secret** object inside a Key Vault
+   resource (Key Vault → Objects → Secrets → Generate/Import).
+2. In the Function App's Application setting, instead of the real value,
+   put a pointer to it:
+   ```
+   SHAREPOINT_CLIENT_SECRET = @Microsoft.KeyVault(SecretUri=https://<vault-name>.vault.azure.net/secrets/<secret-name>)
+   ```
+3. Azure resolves that reference automatically at runtime, using the
+   Function App's managed identity (Step 4) to fetch the real value from
+   Key Vault, and injects the **resolved** value as the environment
+   variable your code reads — your code itself never knows or cares that
+   Key Vault was involved.
+
+- **Pros:** The secret's actual value lives in exactly one place (Key
+  Vault), with its own access policy, audit log (every read is logged),
+  and rotation support — independent of who has access to the Function
+  App's configuration. Revoking access is also one change in one place,
+  rather than hunting down every setting that has the value pasted in.
+- **Cons:** One more resource to manage, and the managed identity needs
+  the **Key Vault Secrets User** role granted (Step 5) before the
+  reference will resolve — until then, the setting shows an error instead
+  of a value.
+- **When to use it:** anything you'd call a real secret in a real
+  environment — this project's `SHAREPOINT_CLIENT_SECRET` is a good
+  example, since it's a credential that grants access to a SharePoint
+  site.
+
+### Choosing between them
+
+A reasonable rule of thumb: **local development → plain value in
+`local.settings.json`** (already excluded from git and never deployed to
+Azure); **anything deployed to a real Azure environment → Key Vault
+reference**, even for a personal dev/test resource group, since it costs
+nothing extra to set up once the Key Vault already exists and avoids ever
+having to "remember" to lock something down later. This project follows
+exactly that split — see `RUNBOOK.md` section 4.4 for how this project's
+SharePoint secret specifically gets moved into Key Vault, and section 4.7
+for how to view a value once it's stored there.
+
 ### Step 7 — Write and deploy your code
 
-Push your function code via CI/CD pipeline, VS Code extension, or a zip
-deploy. The code reads the app settings from Step 6 to know what to
-connect to and what to do.
+If a CI/CD pipeline already exists for this Function App, that's usually
+the intended path — check before deploying manually on top of it. If
+you're deploying from your own laptop instead (no pipeline, or just
+testing a one-off change), here are the two ways to do it:
+
+**Option A — Azure Functions Core Tools (recommended if installed)**
+```bash
+func azure functionapp publish <function-app-name> --python
+```
+Run from your project root with your virtual environment activated. This
+builds the deployment package, installs dependencies, and uploads it in
+one step. You'll know it worked when the terminal prints a success message
+ending in `Functions in <function-app-name>:` followed by your function's
+name.
+
+**Option B — Zip deploy via Azure CLI (no Core Tools needed)**
+```bash
+zip -r ../app.zip . -x ".venv/*" ".git/*"   # Windows: use Compress-Archive instead
+az functionapp deployment source config-zip \
+  --resource-group <resource-group-name> \
+  --name <function-app-name> \
+  --src ../app.zip
+```
+You build the zip yourself; the CLI just uploads it. Useful if Core Tools
+isn't installed and you don't want to install it for a one-off deploy.
+
+Either way, the code reads the app settings from Step 6 to know what to
+connect to and what to do — deploying code never changes those settings.
 
 - **Permission needed:** Contributor on the Function App.
 
