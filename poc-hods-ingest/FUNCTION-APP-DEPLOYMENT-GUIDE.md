@@ -138,6 +138,45 @@ Resource Group
 Two of those storage accounts can be the *same* account (this project does
 that) or two *different* accounts — more on that distinction below.
 
+## How many storage accounts do you actually need?
+
+**The minimum is one.** A single storage account can serve both roles —
+runtime (`AzureWebJobsStorage`) and target (where your ingested files end
+up) — at the same time, just using different containers inside it. This
+project does exactly that: one storage account, with the runtime's own
+auto-created containers sitting alongside a separate `ingest-output`
+container that holds your actual data. For a single, simple
+timer-triggered ingest pipeline like this one, **one storage account is
+sufficient and is the recommended default** — fewer resources to manage,
+fewer places to check when something goes wrong.
+
+**When you'd provision a second one** — none of these apply to this
+project, but they're the usual reasons teams split it into two accounts:
+- **Isolation/governance** — keeping your own ingested data in an account
+  with different access policies, retention rules, or lifecycle
+  management than the runtime's internal bookkeeping data.
+- **Multiple Function Apps sharing infrastructure** — if several unrelated
+  Function Apps live in the same resource group, teams sometimes give each
+  its own runtime storage account to avoid one app's trigger checkpoints
+  competing with another's, though this isn't strictly required.
+- **Durable Functions** — if you ever add orchestration (Durable
+  Functions), its task hub data can get heavy; some teams move that to its
+  own storage account to keep it from crowding the same account as
+  ordinary blob output.
+- **Different redundancy/performance tiers** — e.g., the target data needs
+  geo-redundant storage (GRS) for compliance, but the runtime bookkeeping
+  data doesn't need that level of durability, so splitting them saves cost.
+
+**Bottom line for this app specifically:** if you're checking a resource
+group and see only one storage account dedicated to this Function App,
+that's correct and expected — it's not a missing piece. If you see
+*multiple* storage accounts in the resource group, the extra ones almost
+certainly belong to other components (AI Search, OpenAI, a Static Web App,
+etc. — see `infra/main.bicep`'s full-stack template), not this ingest
+pipeline. Identify the right one by tracing the Function App's
+`AzureWebJobsStorage` / `BLOB_STORAGE_CONNECTION_STRING` settings back to
+a Key Vault secret, rather than guessing by name.
+
 ## Step-by-step
 
 ### Step 1 — Decide on a storage account for the runtime
