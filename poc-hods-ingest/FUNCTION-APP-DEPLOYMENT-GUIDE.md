@@ -9,6 +9,115 @@ is for understanding the *why* behind each step and what permission you
 need at each point — useful if you ever have to build one from scratch, or
 just want to understand what already exists.
 
+## How an Azure Function App actually works
+
+Before the deployment steps below, it helps to understand what a Function
+App actually *is* under the hood — what's a resource vs. what's just a
+file, and what each piece is doing.
+
+### What it is
+
+A Function App is Azure's "serverless" compute service: you give it code
+and a *trigger* (a timer, an HTTP request, a new file appearing somewhere,
+etc.), and Azure runs your code whenever that trigger fires — starting up
+a small sandboxed execution environment behind the scenes, running your
+function, then tearing it down (or keeping it warm for a bit, depending on
+plan). You never provision or manage a VM yourself; Azure does that
+invisibly. The Function App *resource* you see in the Portal is really
+just the control surface — its identity, its name, its settings, its
+billing/scale plan — not the actual running process.
+
+### How it's provisioned
+
+Creating a Function App (via Portal, CLI, or an IaC template like Bicep)
+does three things at once, because a Function App on its own can't run:
+1. Creates the `Microsoft.Web/sites` resource with `kind: functionapp` —
+   this is the "Function App" you see and click on in the Portal.
+2. Attaches it to a **hosting plan** (`Microsoft.Web/serverfarms`) — this
+   decides what compute tier it runs on (Consumption, Premium, Dedicated).
+3. Wires it to a **storage account** via the `AzureWebJobsStorage` setting
+   — required, not optional, because the runtime itself needs somewhere to
+   keep trigger checkpoints and internal locks.
+
+None of this involves your actual code yet — provisioning only creates the
+*host*. The code is uploaded separately, as a deployment step (see below).
+This is why "the platform engineer set up the Function App for me" and
+"my code is running" are two different milestones — the first one only
+gets you an empty, running shell.
+
+### How code gets uploaded
+
+Your code lives in a **deployment package** — for Python, this is your
+project folder (`function_app.py`, `host.json`, `requirements.txt`, etc.)
+zipped up. Azure doesn't care how that zip gets to it; all of these
+mechanisms ultimately do the same thing:
+
+| Method | What happens |
+|---|---|
+| `func azure functionapp publish` (Core Tools) | Builds the zip locally, installs dependencies, uploads it for you |
+| `az functionapp deployment source config-zip` (Azure CLI) | You build the zip yourself, CLI just uploads it |
+| VS Code Azure Functions extension | Same as Core Tools, but driven from the editor UI |
+| CI/CD pipeline (Azure DevOps, GitHub Actions) | Automates the same zip-and-upload step on every commit |
+
+Under the hood, Azure either extracts that zip onto the Function App's
+filesystem, or — more commonly today — mounts the zip directly and runs
+your code straight out of it ("Run From Package"), which is faster and
+avoids partial-deploy states. Either way, **uploading code never touches
+the resources provisioned above** — the Function App, plan, and storage
+account stay exactly as they were; only the code running inside changes.
+
+### How your code is structured for Azure to find it
+
+Two files tell Azure how to treat your code:
+- **`host.json`** — app-wide settings for the whole Function App (timeouts,
+  logging, extension versions). One per project, not per function.
+- **`function_app.py`** (Python v2 programming model) — each function is a
+  plain Python function decorated with its trigger, e.g.
+  `@app.timer_trigger(...)`. Azure's runtime scans this file at startup to
+  discover what functions exist and what triggers them — you don't
+  register functions anywhere else.
+
+### How environment variables / app settings actually work
+
+What you see in the Portal under **Configuration → Environment variables**
+(or "Application settings" in older Portal versions) is a flat list of
+key/value pairs stored as part of the Function App resource itself —
+*not* inside your code or your deployment package. At runtime, Azure
+injects every one of these as a literal OS environment variable into the
+sandbox your code runs in — which is why Python code reads them with
+`os.environ.get("SOME_SETTING")` or `os.getenv(...)`: as far as your code
+is concerned, they're indistinguishable from any other environment
+variable on a normal machine.
+
+A few settings are special, reserved names the *runtime itself* reads, not
+your code:
+- `AzureWebJobsStorage` — the runtime storage connection string from
+  provisioning, above.
+- `FUNCTIONS_WORKER_RUNTIME` — tells Azure which language stack to boot
+  (`python`, `node`, `dotnet`, etc.).
+- `FUNCTIONS_EXTENSION_VERSION` — which major version of the Functions
+  runtime to use.
+
+Everything else (`BLOB_STORAGE_CONNECTION_STRING`, `SHAREPOINT_CLIENT_ID`,
+etc.) is just your own application config — Azure doesn't interpret these,
+your code does.
+
+**Secrets as Key Vault references:** instead of putting a raw secret value
+directly into a setting, you can set the value to
+`@Microsoft.KeyVault(SecretUri=https://<vault>.vault.azure.net/secrets/<name>)`.
+Azure recognizes this special syntax and, using the Function App's managed
+identity, fetches the real secret value from Key Vault and injects *that*
+as the environment variable instead — your code never sees the
+`@Microsoft.KeyVault(...)` string itself, only the resolved value. This
+needs the **Key Vault Secrets User** role granted to the identity (see
+Step 5 below) — without it, the setting will show an error instead of
+resolving.
+
+**Changing a setting takes effect on the next cold start**, not instantly
+mid-execution — if a function is actively warm/running, it may need a
+restart (Azure usually does this automatically when you save settings in
+the Portal) before it picks up a changed value.
+
 ## The big picture
 
 A Function App that ingests files and writes them to Blob Storage is made of
