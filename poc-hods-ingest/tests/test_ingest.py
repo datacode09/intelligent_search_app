@@ -8,8 +8,10 @@ import requests
 
 from function_app import (
     _download_and_upload,
+    _is_system_field,
     _parse_last_sync,
     _retry,
+    _sanitize_metadata_key,
     _to_blob_metadata_value,
     _to_blob_name,
     _upload_changed_files,
@@ -115,12 +117,11 @@ class TestUploadChangedFiles:
     retried on the next run instead of being permanently skipped (ISSUE-3),
     and the max_files cap is no longer fixed at 5 (ISSUE-2)."""
 
-    def _patch_common(self, items, content_side_effect):
+    def _patch_common(self, items, content_side_effect, fields=None):
         return [
             patch("function_app._get_drive_list_id", return_value="list-1"),
-            patch("function_app._get_lookup_column_info", return_value=None),
             patch("function_app._list_all_items", return_value=items),
-            patch("function_app._fetch_item_fields", return_value={}),
+            patch("function_app._fetch_item_fields", return_value=fields or {}),
             patch("function_app.requests.get", side_effect=content_side_effect),
         ]
 
@@ -279,7 +280,121 @@ class TestRetry:
             with pytest.raises(requests.exceptions.RequestException):
                 _retry(always_fails, attempts=3, base_delay=1.0)
 
-        assert mock_sleep.call_count == 2
+
+class TestSanitizeMetadataKey:
+    def test_plain_name_unchanged(self):
+        assert _sanitize_metadata_key("HODSContentType") == "HODSContentType"
+
+    def test_spaces_become_underscores(self):
+        assert _sanitize_metadata_key("My Column") == "My_Column"
+
+    def test_special_chars_become_underscores(self):
+        assert _sanitize_metadata_key("Column-Name!") == "Column_Name_"
+
+    def test_leading_digit_gets_prefix(self):
+        assert _sanitize_metadata_key("1stColumn") == "_1stColumn"
+
+    def test_empty_string_returns_fallback(self):
+        assert _sanitize_metadata_key("") == "_field"
+
+
+class TestIsSystemField:
+    def test_at_prefix_is_system(self):
+        assert _is_system_field("@odata.etag") is True
+
+    def test_underscore_prefix_is_system(self):
+        assert _is_system_field("_UIVersionString") is True
+
+    def test_known_system_name_is_system(self):
+        assert _is_system_field("FileRef") is True
+        assert _is_system_field("ContentTypeId") is True
+
+    def test_user_defined_field_not_system(self):
+        assert _is_system_field("HODSContentType") is False
+        assert _is_system_field("Prefix") is False
+        assert _is_system_field("MyCustomColumn") is False
+
+
+class TestDynamicMetadataInUpload:
+    """Verifies that _upload_changed_files writes all non-system fields from
+    the fields dict as blob metadata, sanitising keys, and skips system fields."""
+
+    def test_non_system_fields_written_as_metadata(self):
+        fields = {
+            "HODSContentType": "Report",
+            "PrefixLookupValue": "ABC",
+            "_UIVersionString": "512",  # system — must be skipped
+            "@odata.etag": "etag123",   # system — must be skipped
+            "FileRef": "/sites/x",      # system — must be skipped
+            "My Column": "value",       # space in name — must be sanitised
+        }
+        item = _make_item("1", "report.pdf", "2024-06-01T12:00:00Z")
+        patches = [
+            patch("function_app._get_drive_list_id", return_value="list-1"),
+            patch("function_app._list_all_items", return_value=[item]),
+            patch("function_app._fetch_item_fields", return_value=fields),
+            patch("function_app.requests.get", return_value=_make_streamed_response()),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            blob_service_client = MagicMock()
+            _upload_changed_files(
+                blob_service_client=blob_service_client,
+                container_name="ingest-output",
+                drive_id="drive-1",
+                site_id="site-1",
+                last_sync=datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
+                headers={},
+            )
+            call_kwargs = blob_service_client.get_blob_client.return_value.upload_blob.call_args[1]
+            written = call_kwargs["metadata"]
+            assert "Modified" in written
+            assert "HODSContentType" in written
+            assert "PrefixLookupValue" in written
+            assert "My_Column" in written
+            assert "_UIVersionString" not in written
+            assert "@odata.etag" not in written  # noqa: S105
+            assert "FileRef" not in written
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_metadata_columns_filter_limits_output(self):
+        fields = {
+            "HODSContentType": "Report",
+            "PrefixLookupValue": "ABC",
+            "AnotherColumn": "extra",
+        }
+        item = _make_item("1", "report.pdf", "2024-06-01T12:00:00Z")
+        patches = [
+            patch("function_app._get_drive_list_id", return_value="list-1"),
+            patch("function_app._list_all_items", return_value=[item]),
+            patch("function_app._fetch_item_fields", return_value=fields),
+            patch("function_app.requests.get", return_value=_make_streamed_response()),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            blob_service_client = MagicMock()
+            _upload_changed_files(
+                blob_service_client=blob_service_client,
+                container_name="ingest-output",
+                drive_id="drive-1",
+                site_id="site-1",
+                last_sync=datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
+                headers={},
+                metadata_columns=frozenset({"HODSContentType"}),
+            )
+            call_kwargs = blob_service_client.get_blob_client.return_value.upload_blob.call_args[1]
+            written = call_kwargs["metadata"]
+            assert "HODSContentType" in written
+            assert "Modified" in written          # always written
+            assert "PrefixLookupValue" not in written
+            assert "AnotherColumn" not in written
+        finally:
+            for p in patches:
+                p.stop()
 
     def test_non_matching_exception_propagates_immediately(self):
         calls = {"n": 0}

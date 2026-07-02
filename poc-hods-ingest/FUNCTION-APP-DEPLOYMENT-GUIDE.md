@@ -461,14 +461,35 @@ Metadata is set at upload time via the `metadata=` argument on
 `upload_blob(...)` — this project's `_download_and_upload()` helper
 (`function_app.py:28-35`) does exactly that for every file it writes.
 
-**For each file this pipeline uploads, three metadata keys are set**
-(`function_app.py:346-380`):
+**For each file this pipeline uploads, blob metadata is written dynamically
+from every non-system column on the SharePoint document library** —
+no hardcoded column list, so new columns added to the site automatically
+show up as blob metadata on the next run without any code change
+(`function_app.py:378-388`).
 
-| Metadata key | Where it comes from | Notes |
-|---|---|---|
-| `Modified` | The file's `lastModifiedDateTime` from SharePoint/Graph | Always set |
-| `Prefix` | The SharePoint list item's `Prefix` lookup column, resolved to its human-readable display value | Set only if the lookup resolves; a warning is logged if it can't be found |
-| `ContentType` | The SharePoint list item's `HODSContentType` column (a multi-value lookup, serialized as a JSON array string) | Set only if the field exists on the item |
+Two always-present keys:
+
+| Metadata key | Where it comes from |
+|---|---|
+| `Modified` | The file's `lastModifiedDateTime` from SharePoint/Graph — always written, required by the sync algorithm |
+| *(every other column)* | Every non-system field returned by the Microsoft Graph `sites/lists` endpoint for that list item |
+
+**System fields are automatically skipped** — SharePoint returns many
+internal fields alongside user-defined ones (`@odata.etag`,
+`_UIVersionString`, `ContentTypeId`, `FileRef`, `FileDirRef`, etc.).
+The pipeline filters these out using `_is_system_field()`.
+
+**Column names are sanitized** — Azure Blob metadata keys must be valid
+C# identifiers. `_sanitize_metadata_key()` replaces spaces and special
+characters with `_` so a SharePoint column named `My Column` becomes blob
+metadata key `My_Column`.
+
+**Optional filter via `INGEST_METADATA_COLUMNS`** — if you only want a
+controlled subset written (e.g. to keep blob metadata compact for a
+library with many columns), set this to a comma-separated list of
+SharePoint internal column names (e.g. `Prefix,HODSContentType`). Only
+those columns (plus `Modified`) will be written. When unset, all
+non-system columns are written.
 
 A few behaviors worth knowing when you're checking the container by hand:
 - **Blob names are sanitized**, not a 1:1 copy of the SharePoint file name

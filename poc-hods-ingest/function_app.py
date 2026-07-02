@@ -170,6 +170,32 @@ def _to_blob_name(file_name: str) -> str:
     return normalized
 
 
+_SYSTEM_FIELDS = frozenset({
+    "id", "ID", "ContentTypeId", "FileRef", "FileDirRef", "FileLeafRef",
+    "FSObjType", "UniqueId", "owshiddenversion", "ProgId", "ScopeId",
+    "InstanceID", "Order", "GUID", "WorkflowVersion", "WorkflowInstanceID",
+    "ParentVersionString", "ParentLeafName",
+})
+
+
+def _is_system_field(key: str) -> bool:
+    """Return True for SharePoint internal/system fields that should not become blob metadata."""
+    if key.startswith(("@", "_")):
+        return True
+    return key in _SYSTEM_FIELDS
+
+
+def _sanitize_metadata_key(key: str) -> str:
+    """Convert a SharePoint field name to a valid Azure Blob metadata key.
+
+    Blob metadata keys must be valid C# identifiers: [a-zA-Z_][a-zA-Z0-9_]*.
+    """
+    sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", key)
+    if sanitized and sanitized[0].isdigit():
+        sanitized = "_" + sanitized
+    return sanitized or "_field"
+
+
 def _to_blob_metadata_value(raw_value: object) -> str:
     if raw_value is None:
         return ""
@@ -291,12 +317,12 @@ def _fetch_item_fields(
         logging.warning("Could not resolve SharePoint item ID for drive item %s", item_id)
         return {}
 
-    # Step 2: fetch fields via the sites/lists endpoint.  This path is more
-    # feature-complete and returns LookupValue for lookup columns.
-    select = "PrefixLookupId,PrefixLookupValue,HODSContentType"
+    # Step 2: fetch all fields — no $select so every column defined on the
+    # library is returned, including lookup display values that the drive-based
+    # endpoint omits.
     fields_url = (
         f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}"
-        f"/items/{sp_item_id}?$expand=fields($select={select})"
+        f"/items/{sp_item_id}?$expand=fields"
     )
     fields_json = _graph_get(fields_url, headers)
     fields = (fields_json.get("fields") or {})
@@ -312,10 +338,10 @@ def _upload_changed_files(
     last_sync: datetime.datetime,
     headers: Dict[str, str],
     max_files: int = 500,
+    metadata_columns: Optional[frozenset] = None,
 ) -> "tuple[int, Optional[datetime.datetime]]":
     # Resolve the SharePoint list ID once for the whole run.
     list_id = _get_drive_list_id(drive_id, headers)
-    prefix_lookup_info = _get_lookup_column_info(site_id, list_id, "Prefix", headers)
     uploaded = 0
     earliest_success: Optional[datetime.datetime] = None
     latest_success: Optional[datetime.datetime] = None
@@ -346,44 +372,27 @@ def _upload_changed_files(
         blob_name = _to_blob_name(file_name)
         blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
 
-        # Fetch SharePoint list-item fields once for all metadata columns.
+        # Fetch all SharePoint list-item fields for this file.
         fields = _fetch_item_fields(drive_id, item_id, site_id, list_id, headers)
 
         metadata: Dict[str, str] = {}
 
-        # Always capture the last-modified timestamp.
+        # Always capture the last-modified timestamp from the drive item.
         metadata["Modified"] = _to_blob_metadata_value(modified_raw)
 
-        # Always capture the single-value "Prefix" lookup column as text.
-        prefix_raw = fields.get("PrefixLookupValue")
-        if prefix_raw is None:
-            prefix_lookup_id = fields.get("PrefixLookupId")
-            if prefix_lookup_id is not None and prefix_lookup_info:
-                prefix_raw = _get_lookup_item_display_value(
-                    site_id=site_id,
-                    lookup_list_id=prefix_lookup_info["lookup_list_id"],
-                    lookup_item_id=prefix_lookup_id,
-                    lookup_column=prefix_lookup_info["lookup_column"],
-                    headers=headers,
-                )
+        # Write every non-system field as blob metadata. If INGEST_METADATA_COLUMNS
+        # is set, only the named columns are written; otherwise all are written.
+        for key, value in fields.items():
+            if _is_system_field(key):
+                continue
+            if metadata_columns is not None and key not in metadata_columns:
+                continue
+            blob_key = _sanitize_metadata_key(key)
+            blob_val = _to_blob_metadata_value(value)
+            if blob_val:
+                metadata[blob_key] = blob_val
 
-        if prefix_raw is not None:
-            metadata["Prefix"] = _to_blob_metadata_value(prefix_raw)
-        else:
-            logging.warning(
-                "Could not resolve Prefix display value for item %s. Available field keys: %s",
-                item_id, sorted(fields.keys()),
-            )
-
-        # Always capture the multi-value "HODS Content Type" lookup column.
-        hods_content_type_raw = fields.get("HODSContentType")
-        if hods_content_type_raw is not None:
-            metadata["ContentType"] = _to_blob_metadata_value(hods_content_type_raw)
-        else:
-            logging.warning(
-                "'HODSContentType' field not found for item %s. Available field keys: %s",
-                item_id, sorted(fields.keys()),
-            )
+        logging.info("Item %s metadata keys written: %s", item_id, sorted(metadata.keys()))
 
         _retry(lambda: _download_and_upload(content_url, headers, blob_client, metadata))
         uploaded += 1
@@ -493,6 +502,11 @@ def Ingest(myTimer: func.TimerRequest) -> None:
         drive_id = _get_drive_id(site_id, drive_name, headers)
 
         max_files = int(os.getenv("INGEST_MAX_FILES_PER_RUN", "500"))
+        columns_raw = os.getenv("INGEST_METADATA_COLUMNS", "").strip()
+        metadata_columns = (
+            frozenset(c.strip() for c in columns_raw.split(",") if c.strip())
+            if columns_raw else None
+        )
         uploaded_count, earliest_success = _upload_changed_files(
             blob_service_client=blob_service_client,
             container_name=container_name,
@@ -501,6 +515,7 @@ def Ingest(myTimer: func.TimerRequest) -> None:
             last_sync=last_sync,
             headers=headers,
             max_files=max_files,
+            metadata_columns=metadata_columns,
         )
         logging.info("Completed SharePoint sync. Files uploaded: %s", uploaded_count)
     except Exception as exc:
