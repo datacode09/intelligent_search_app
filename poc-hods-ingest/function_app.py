@@ -200,25 +200,56 @@ def _to_blob_metadata_value(raw_value: object) -> str:
     if raw_value is None:
         return ""
     if isinstance(raw_value, list):
-        # Multi-value lookup columns are returned as a list of
-        # {"LookupId": ..., "LookupValue": ...} objects.  Extract just
-        # the display values and serialise as a JSON array.
+        # Multi-value lookup columns: list of {"LookupId": ..., "LookupValue": ...}
+        # or managed metadata: list of {"Label": ..., "TermGuid": ...}.
         values: List[str] = []
         for item in raw_value:
             if isinstance(item, dict):
-                lookup_value = item.get("LookupValue") or item.get("lookupValue")
-                values.append(str(lookup_value) if lookup_value is not None else str(item))
+                display = (
+                    item.get("LookupValue") or item.get("lookupValue") or item.get("Label")
+                )
+                values.append(str(display) if display is not None else str(item))
             else:
                 values.append(str(item))
         text = json.dumps(values, ensure_ascii=True)
     elif isinstance(raw_value, dict):
-        # Single-value lookup columns are returned as {"LookupId": ..., "LookupValue": ...}.
-        lookup_value = raw_value.get("LookupValue") or raw_value.get("lookupValue")
-        text = str(lookup_value) if lookup_value is not None else str(raw_value)
+        # Single-value lookup: {"LookupId": ..., "LookupValue": ...}
+        # Managed metadata (taxonomy): {"Label": "...", "TermGuid": "...", "WssId": ...}
+        display = (
+            raw_value.get("LookupValue") or raw_value.get("lookupValue") or raw_value.get("Label")
+        )
+        text = str(display) if display is not None else str(raw_value)
     else:
         text = str(raw_value)
     # Azure Blob metadata values are ASCII-only; drop unsupported chars.
     return text.encode("ascii", errors="ignore").decode("ascii")
+
+
+_BLOB_METADATA_MAX_BYTES = 8000  # 8 KB limit minus HTTP header overhead
+
+
+def _trim_metadata(metadata: Dict[str, str], item_id: str = "") -> Dict[str, str]:
+    """Drop values (longest first) until total byte count fits within 8 KB.
+
+    Azure Blob Storage rejects upload_blob calls whose combined metadata
+    key+value bytes exceed 8,192. 'Modified' is always preserved.
+    """
+    total = sum(len(k) + len(v) for k, v in metadata.items())
+    if total <= _BLOB_METADATA_MAX_BYTES:
+        return metadata
+    protected = {k: v for k, v in metadata.items() if k == "Modified"}
+    candidates = sorted(
+        [(k, v) for k, v in metadata.items() if k != "Modified"],
+        key=lambda kv: len(kv[1]),
+        reverse=True,
+    )
+    result = dict(protected)
+    for k, v in candidates:
+        if sum(len(kk) + len(vv) for kk, vv in result.items()) + len(k) + len(v) <= _BLOB_METADATA_MAX_BYTES:
+            result[k] = v
+        else:
+            logging.warning("Metadata key '%s' dropped for item %s: would exceed 8 KB limit", k, item_id)
+    return result
 
 
 def _get_drive_list_id(drive_id: str, headers: Dict[str, str]) -> str:
@@ -377,11 +408,23 @@ def _upload_changed_files(
 
         metadata: Dict[str, str] = {}
 
-        # Always capture the last-modified timestamp from the drive item.
+        # Native drive item properties — available without an extra API call.
         metadata["Modified"] = _to_blob_metadata_value(modified_raw)
+        _created_raw = item.get("createdDateTime")
+        if _created_raw:
+            metadata["Created"] = _to_blob_metadata_value(_created_raw)
+        _size = item.get("size")
+        if _size is not None:
+            metadata["Size"] = str(_size)
+        _created_by = ((item.get("createdBy") or {}).get("user") or {}).get("displayName")
+        if _created_by:
+            metadata["CreatedBy"] = _to_blob_metadata_value(_created_by)
+        _modified_by = ((item.get("lastModifiedBy") or {}).get("user") or {}).get("displayName")
+        if _modified_by:
+            metadata["ModifiedBy"] = _to_blob_metadata_value(_modified_by)
 
-        # Write every non-system field as blob metadata. If INGEST_METADATA_COLUMNS
-        # is set, only the named columns are written; otherwise all are written.
+        # Write every non-system SharePoint column as blob metadata.
+        # INGEST_METADATA_COLUMNS optionally limits which columns are written.
         for key, value in fields.items():
             if _is_system_field(key):
                 continue
@@ -392,6 +435,7 @@ def _upload_changed_files(
             if blob_val:
                 metadata[blob_key] = blob_val
 
+        metadata = _trim_metadata(metadata, item_id)
         logging.info("Item %s metadata keys written: %s", item_id, sorted(metadata.keys()))
 
         _retry(lambda: _download_and_upload(content_url, headers, blob_client, metadata))

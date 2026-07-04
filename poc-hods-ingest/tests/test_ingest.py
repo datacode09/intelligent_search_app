@@ -14,6 +14,7 @@ from function_app import (
     _sanitize_metadata_key,
     _to_blob_metadata_value,
     _to_blob_name,
+    _trim_metadata,
     _upload_changed_files,
 )
 
@@ -104,6 +105,44 @@ class TestToBlobMetadataValue:
     def test_non_ascii_stripped(self):
         result = _to_blob_metadata_value("héllo")
         assert result == "hllo"
+
+    def test_taxonomy_label_extracted(self):
+        result = _to_blob_metadata_value({"Label": "Berlin", "TermGuid": "3fce150e-bd09-4075", "WssId": 5})
+        assert result == "Berlin"
+
+    def test_taxonomy_in_list(self):
+        result = _to_blob_metadata_value([{"Label": "Berlin"}, {"Label": "Paris"}])
+        assert "Berlin" in result
+        assert "Paris" in result
+
+    def test_dict_without_known_keys_falls_back_to_str(self):
+        result = _to_blob_metadata_value({"SomeOtherKey": "value"})
+        assert "SomeOtherKey" in result
+
+
+class TestTrimMetadata:
+    def test_under_limit_unchanged(self):
+        meta = {"Modified": "2024-01-01", "Title": "short"}
+        assert _trim_metadata(meta, "item1") == meta
+
+    def test_over_limit_drops_longest(self):
+        # 9 (key) + 8000 (val) + existing fixed keys ≈ 8034 bytes total → over limit
+        long_val = "x" * 8000
+        meta = {"Modified": "2024-01-01", "LongField": long_val, "Short": "abc"}
+        result = _trim_metadata(meta, "item1")
+        assert "Modified" in result
+        assert "Short" in result
+        assert "LongField" not in result
+
+    def test_modified_always_kept(self):
+        long_val = "x" * 8000
+        meta = {"Modified": "2024-01-01", "BigField": long_val}
+        result = _trim_metadata(meta, "item1")
+        assert "Modified" in result
+        assert "BigField" not in result
+
+    def test_empty_metadata_unchanged(self):
+        assert _trim_metadata({}, "item1") == {}
 
 
 def _make_item(item_id, name, modified):
