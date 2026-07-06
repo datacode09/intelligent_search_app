@@ -5,13 +5,16 @@ import logging
 import os
 import re
 import time
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlencode
 
 import requests
 
 from azure.storage.blob import BlobServiceClient
 
 app = func.FunctionApp()
+
+DELTA_STATE_BLOB_NAME_DEFAULT = "hods-library-delta-state.json"
 
 
 def _retry(call, attempts=3, base_delay=1.0, retry_on=(requests.exceptions.RequestException,)):
@@ -97,8 +100,15 @@ def _get_graph_token(tenant_id: str, client_id: str, client_secret: str) -> str:
 
 def _graph_get(url: str, headers: Dict[str, str]) -> Dict:
     response = requests.get(url, headers=headers, timeout=60)
+    if not response.ok:
+        logging.error("Graph GET failed. URL=%s Body=%s", url, response.text)
     response.raise_for_status()
     return response.json()
+
+
+def _graph_get_with_params(url: str, headers: Dict[str, str], params: Dict) -> Dict:
+    full_url = f"{url}?{urlencode(params)}"
+    return _graph_get(full_url, headers)
 
 
 def _get_site_id(hostname: str, site_path: str, headers: Dict[str, str]) -> str:
@@ -254,12 +264,198 @@ def _trim_metadata(metadata: Dict[str, str], item_id: str = "") -> Dict[str, str
 
 def _get_drive_list_id(drive_id: str, headers: Dict[str, str]) -> str:
     """Return the SharePoint list GUID for the document library behind a drive."""
-    drive_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}?$select=id,sharePointIds"
-    drive_json = _graph_get(drive_url, headers)
-    list_id = ((drive_json.get("sharePointIds") or {}).get("listId"))
+    url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/list"
+    list_json = _graph_get(url, headers)
+    list_id = list_json.get("id")
     if not list_id:
         raise RuntimeError(f"Could not resolve SharePoint list ID for drive '{drive_id}'")
     return list_id
+
+
+def _to_utc_iso(dt: datetime.datetime) -> str:
+    return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _get_allowed_extensions() -> List[str]:
+    raw = os.getenv("INGEST_FILE_EXTENSIONS", ".pdf").strip()
+    if raw == "**":
+        return []
+    return [
+        (e.strip() if e.strip().startswith(".") else "." + e.strip()).lower()
+        for e in raw.split(";") if e.strip()
+    ]
+
+
+def _is_allowed_file_name(name: str, exts: List[str]) -> bool:
+    if not exts:
+        return True
+    _, ext = os.path.splitext((name or "").lower())
+    return ext in exts
+
+
+def _ensure_container(blob_svc: BlobServiceClient, container: str) -> None:
+    try:
+        blob_svc.get_container_client(container).create_container()
+        logging.info("Created blob container '%s'", container)
+    except Exception:
+        pass  # already exists
+
+
+def _read_delta_state(blob_svc: BlobServiceClient, container: str, blob_name: str) -> Optional[str]:
+    try:
+        data = blob_svc.get_blob_client(container=container, blob=blob_name).download_blob().readall()
+        return json.loads(data).get("deltaLink")
+    except Exception:
+        return None
+
+
+def _save_delta_state(
+    blob_svc: BlobServiceClient,
+    container: str,
+    blob_name: str,
+    delta_link: str,
+    drive_name: str,
+) -> None:
+    payload = json.dumps({
+        "deltaLink": delta_link,
+        "driveName": drive_name,
+        "updatedAt": _to_utc_iso(datetime.datetime.now(datetime.timezone.utc)),
+    })
+    blob_svc.get_blob_client(container=container, blob=blob_name).upload_blob(payload, overwrite=True)
+
+
+def _initialize_delta_tracking_latest(drive_id: str, headers: Dict[str, str]) -> str:
+    url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root/delta?token=latest"
+    data = _graph_get(url, headers)
+    delta_link = data.get("@odata.deltaLink")
+    if not delta_link:
+        raise RuntimeError("No @odata.deltaLink in delta?token=latest response")
+    return delta_link
+
+
+def _get_delta_changes(
+    delta_link: str,
+    headers: Dict[str, str],
+    max_items: int,
+) -> "Tuple[List[Dict], str]":
+    changes: List[Dict] = []
+    final_delta_link: Optional[str] = None
+    current_url: Optional[str] = delta_link
+    while current_url:
+        page = _graph_get(current_url, headers)
+        changes.extend(page.get("value", []))
+        final_delta_link = page.get("@odata.deltaLink")
+        current_url = page.get("@odata.nextLink") if not final_delta_link else None
+    if not final_delta_link:
+        raise RuntimeError("Delta query did not return @odata.deltaLink")
+    return changes[:max_items], final_delta_link
+
+
+def _list_recent_files_from_hods_list(
+    site_id: str,
+    list_id: str,
+    drive_id: str,
+    drive_name: str,
+    headers: Dict[str, str],
+    cutoff: datetime.datetime,
+    max_files: int,
+    allowed_extensions: List[str],
+) -> List[Dict]:
+    cutoff_str = _to_utc_iso(cutoff)
+    url: Optional[str] = (
+        f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items"
+        f"?$expand=driveItem&$filter=fields/Modified ge '{cutoff_str}'&$top=200"
+    )
+    items: List[Dict] = []
+    while url and len(items) < max_files:
+        page = _graph_get(url, headers)
+        for list_item in page.get("value", []):
+            drive_item = list_item.get("driveItem") or {}
+            name = drive_item.get("name", "")
+            if not _is_allowed_file_name(name, allowed_extensions):
+                continue
+            if "file" not in drive_item:
+                continue
+            items.append(drive_item)
+        url = page.get("@odata.nextLink")
+    return items[:max_files]
+
+
+def _upload_drive_items(
+    blob_svc: BlobServiceClient,
+    container: str,
+    drive_id: str,
+    site_id: str,
+    items: List[Dict],
+    headers: Dict[str, str],
+    list_id: str,
+    allowed_extensions: List[str],
+) -> int:
+    uploaded = 0
+    prefix_lookup_info = _get_lookup_column_info(site_id, list_id, "Prefix", headers)
+    for item in items:
+        if "deleted" in item:
+            continue
+        if "file" not in item:
+            continue
+        name = item.get("name", "")
+        if not _is_allowed_file_name(name, allowed_extensions):
+            continue
+        item_id = item.get("id")
+        if not item_id:
+            continue
+        modified_raw = item.get("lastModifiedDateTime", "")
+        content_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content"
+        blob_name = _to_blob_name(name)
+        blob_client = blob_svc.get_blob_client(container=container, blob=blob_name)
+        fields = _fetch_item_fields(drive_id, item_id, site_id, list_id, headers)
+
+        metadata: Dict[str, str] = {}
+        metadata["Modified"] = _to_blob_metadata_value(modified_raw)
+        _created_raw = item.get("createdDateTime")
+        if _created_raw:
+            metadata["Created"] = _to_blob_metadata_value(_created_raw)
+        _size = item.get("size")
+        if _size is not None:
+            metadata["Size"] = str(_size)
+        _created_by = ((item.get("createdBy") or {}).get("user") or {}).get("displayName")
+        if _created_by:
+            metadata["CreatedBy"] = _to_blob_metadata_value(_created_by)
+        _modified_by = ((item.get("lastModifiedBy") or {}).get("user") or {}).get("displayName")
+        if _modified_by:
+            metadata["ModifiedBy"] = _to_blob_metadata_value(_modified_by)
+
+        for key, value in fields.items():
+            if _is_system_field(key):
+                continue
+            blob_key = _sanitize_metadata_key(key)
+            blob_val = _to_blob_metadata_value(value)
+            if blob_val:
+                metadata[blob_key] = blob_val
+
+        # HODS-specific: resolve Prefix display value when Graph returns only the lookup ID.
+        prefix_display = fields.get("PrefixLookupValue")
+        if prefix_display is None:
+            prefix_lookup_id = fields.get("PrefixLookupId")
+            if prefix_lookup_id is not None and prefix_lookup_info is not None:
+                prefix_display = _get_lookup_item_display_value(
+                    site_id,
+                    prefix_lookup_info["lookup_list_id"],
+                    prefix_lookup_id,
+                    prefix_lookup_info["lookup_column"],
+                    headers,
+                )
+        if prefix_display is not None:
+            metadata["Prefix"] = _to_blob_metadata_value(prefix_display)
+
+        if fields.get("HODSContentType") is None:
+            logging.warning("'HODSContentType' field not found for item %s", item_id)
+
+        metadata = _trim_metadata(metadata, item_id)
+        logging.info("Item %s metadata keys written: %s", item_id, sorted(metadata.keys()))
+        _retry(lambda: _download_and_upload(content_url, headers, blob_client, metadata))
+        uploaded += 1
+    return uploaded
 
 
 def _get_lookup_column_info(site_id: str, list_id: str, column_name: str, headers: Dict[str, str]) -> Optional[Dict[str, str]]:
@@ -480,9 +676,9 @@ def _upload_changed_files(
 @app.timer_trigger(schedule=os.getenv("INGEST_SCHEDULE_CRON", "0 0 * * * *"), arg_name="myTimer", run_on_startup=False,
               use_monitor=False)
 def Ingest(myTimer: func.TimerRequest) -> None:
-    
+
     if myTimer.past_due:
-        logging.info('The timer is past due!')
+        logging.info("The timer is past due!")
 
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     blob_connection_string = os.getenv("BLOB_STORAGE_CONNECTION_STRING")
@@ -494,6 +690,9 @@ def Ingest(myTimer: func.TimerRequest) -> None:
     site_path = os.getenv("SHAREPOINT_SITE_PATH")
     site_id_override = os.getenv("SHAREPOINT_SITE_ID")
     drive_name = os.getenv("SHAREPOINT_LIBRARY_DRIVE_NAME", "Documents")
+    delta_state_blob_name = os.getenv("DELTA_STATE_BLOB_NAME", DELTA_STATE_BLOB_NAME_DEFAULT)
+    max_files = int(os.getenv("INGEST_MAX_FILES_PER_RUN", "100"))
+    allowed_extensions = _get_allowed_extensions()
 
     if not blob_connection_string:
         logging.error("Missing app setting: BLOB_STORAGE_CONNECTION_STRING")
@@ -535,65 +734,42 @@ def Ingest(myTimer: func.TimerRequest) -> None:
     # BLOB_STORAGE_ACCOUNT_URL, run `az login`, then `func start` — blobs should
     # upload using your local identity.
     blob_service_client = BlobServiceClient.from_connection_string(blob_connection_string)
-
-    # Read last-sync value from blob storage
-    last_sync_raw = None
-    try:
-        last_sync_blob_client = blob_service_client.get_blob_client(container=container_name, blob="last-sync")
-        last_sync_raw = last_sync_blob_client.download_blob().readall().decode("utf-8")
-        logging.info("Last sync raw value: %s", last_sync_raw)
-    except Exception:
-        logging.info("No last-sync blob found, this may be the first run")
-
-    # If this is the first run (no last-sync blob yet), start from
-    # INGEST_START_DATE instead of the Unix epoch, so a fresh deployment
-    # doesn't try to ingest every file ever modified in the source.
-    start_date_raw = os.getenv("INGEST_START_DATE")
-    default_start = _parse_last_sync(start_date_raw) if start_date_raw else _EPOCH
-    last_sync = _parse_last_sync(last_sync_raw, default=default_start)
-    logging.info("Using last-sync timestamp (UTC): %s", last_sync.isoformat())
-
-    try:
-        container_client = blob_service_client.get_container_client(container_name)
-        container_client.create_container()
-    except Exception:
-        # Container may already exist, so continue with upload attempt.
-        pass
+    _ensure_container(blob_service_client, container_name)
 
     try:
         token = _get_graph_token(tenant_id, client_id, client_secret)
         headers = {"Authorization": f"Bearer {token}"}
         site_id = _resolve_site_id(site_hostname, site_path, headers, site_id_override)
         drive_id = _get_drive_id(site_id, drive_name, headers)
+        list_id = _get_drive_list_id(drive_id, headers)
 
-        max_files = int(os.getenv("INGEST_MAX_FILES_PER_RUN", "500"))
-        columns_raw = os.getenv("INGEST_METADATA_COLUMNS", "").strip()
-        metadata_columns = (
-            frozenset(c.strip() for c in columns_raw.split(",") if c.strip())
-            if columns_raw else None
-        )
-        uploaded_count, earliest_success = _upload_changed_files(
-            blob_service_client=blob_service_client,
-            container_name=container_name,
-            drive_id=drive_id,
-            site_id=site_id,
-            last_sync=last_sync,
-            headers=headers,
-            max_files=max_files,
-            metadata_columns=metadata_columns,
-        )
-        logging.info("Completed SharePoint sync. Files uploaded: %s", uploaded_count)
+        existing_delta_link = _read_delta_state(blob_service_client, container_name, delta_state_blob_name)
+
+        if existing_delta_link is None:
+            # First run: seed from recent SP list items, then capture a delta baseline.
+            start_date_raw = os.getenv("INGEST_START_DATE")
+            cutoff = _parse_last_sync(start_date_raw) if start_date_raw else now_utc
+            logging.info("First run: seeding from SP list items modified since %s", _to_utc_iso(cutoff))
+            recent_items = _list_recent_files_from_hods_list(
+                site_id, list_id, drive_id, drive_name, headers, cutoff, max_files, allowed_extensions,
+            )
+            uploaded_count = _upload_drive_items(
+                blob_service_client, container_name, drive_id, site_id,
+                recent_items, headers, list_id, allowed_extensions,
+            )
+            new_delta_link = _initialize_delta_tracking_latest(drive_id, headers)
+            _save_delta_state(blob_service_client, container_name, delta_state_blob_name, new_delta_link, drive_name)
+            logging.info("First-run ingestion completed. Recent files uploaded: %s", uploaded_count)
+        else:
+            # Incremental run: fetch only changed items since last delta.
+            logging.info("Incremental run: fetching delta changes")
+            raw_delta_items, refreshed_delta_link = _get_delta_changes(existing_delta_link, headers, max_files)
+            uploaded_count = _upload_drive_items(
+                blob_service_client, container_name, drive_id, site_id,
+                raw_delta_items, headers, list_id, allowed_extensions,
+            )
+            _save_delta_state(blob_service_client, container_name, delta_state_blob_name, refreshed_delta_link, drive_name)
+            logging.info("Ingestion completed. Files uploaded: %s", uploaded_count)
+
     except Exception as exc:
         logging.exception("Failed to sync SharePoint files: %s", exc)
-        return
-    
-    # Advance last-sync only as far as the earliest successfully uploaded file's
-    # modified time, not to now_utc. If a mid-batch upload fails, files after it
-    # are retried on the next run instead of being silently skipped forever.
-    try:
-        last_sync_time = (earliest_success or now_utc).isoformat()
-        config_blob_client = blob_service_client.get_blob_client(container=container_name, blob="last-sync")
-        config_blob_client.upload_blob(last_sync_time, overwrite=True)
-        logging.info("Updated last-sync to: %s", last_sync_time)
-    except Exception as exc:
-        logging.exception("Failed to update last-sync blob: %s", exc)

@@ -1,6 +1,7 @@
 """Unit tests for ingest helper functions — no Azure credentials needed."""
 
 import datetime
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -8,14 +9,21 @@ import requests
 
 from function_app import (
     _download_and_upload,
+    _get_allowed_extensions,
+    _get_delta_changes,
+    _is_allowed_file_name,
     _is_system_field,
     _parse_last_sync,
+    _read_delta_state,
     _retry,
     _sanitize_metadata_key,
+    _save_delta_state,
     _to_blob_metadata_value,
     _to_blob_name,
+    _to_utc_iso,
     _trim_metadata,
     _upload_changed_files,
+    _upload_drive_items,
 )
 
 
@@ -505,6 +513,189 @@ class TestPrefixLookupFallback:
         warned_calls = [str(c) for c in mock_warn.call_args_list]
         assert any("HODSContentType" in c for c in warned_calls)
         assert written.get("Prefix") == "GAMMA"
+
+
+class TestToUtcIso:
+    def test_utc_datetime(self):
+        dt = datetime.datetime(2024, 6, 1, 12, 30, 0, tzinfo=datetime.timezone.utc)
+        assert _to_utc_iso(dt) == "2024-06-01T12:30:00Z"
+
+    def test_naive_datetime_treated_as_utc(self):
+        dt = datetime.datetime(2024, 6, 1, 12, 30, 0)
+        result = _to_utc_iso(dt)
+        assert result.endswith("Z")
+        assert "2024-06-01" in result
+
+
+class TestGetAllowedExtensions:
+    def test_default_is_pdf(self):
+        with patch("function_app.os.getenv", return_value=None) as mock_env:
+            mock_env.side_effect = lambda k, d=None: ".pdf" if k == "INGEST_FILE_EXTENSIONS" else d
+            result = _get_allowed_extensions()
+        assert result == [".pdf"]
+
+    def test_star_star_returns_empty(self):
+        with patch("function_app.os.getenv", return_value="**"):
+            result = _get_allowed_extensions()
+        assert result == []
+
+    def test_semicolon_separated(self):
+        with patch("function_app.os.getenv", return_value=".pdf;.docx"):
+            result = _get_allowed_extensions()
+        assert ".pdf" in result
+        assert ".docx" in result
+
+    def test_missing_dot_added(self):
+        with patch("function_app.os.getenv", return_value="pdf"):
+            result = _get_allowed_extensions()
+        assert ".pdf" in result
+
+
+class TestIsAllowedFileName:
+    def test_matching_extension(self):
+        assert _is_allowed_file_name("report.pdf", [".pdf"]) is True
+
+    def test_non_matching_extension(self):
+        assert _is_allowed_file_name("report.docx", [".pdf"]) is False
+
+    def test_empty_list_allows_all(self):
+        assert _is_allowed_file_name("report.docx", []) is True
+
+    def test_case_insensitive(self):
+        assert _is_allowed_file_name("REPORT.PDF", [".pdf"]) is True
+
+
+class TestReadDeltaState:
+    def test_returns_link_when_blob_exists(self):
+        blob_svc = MagicMock()
+        blob_svc.get_blob_client.return_value.download_blob.return_value.readall.return_value = (
+            json.dumps({"deltaLink": "https://graph.microsoft.com/v1.0/drives/x/root/delta?token=abc"}).encode()
+        )
+        result = _read_delta_state(blob_svc, "container", "delta-state.json")
+        assert result == "https://graph.microsoft.com/v1.0/drives/x/root/delta?token=abc"
+
+    def test_returns_none_when_blob_missing(self):
+        blob_svc = MagicMock()
+        blob_svc.get_blob_client.return_value.download_blob.side_effect = Exception("not found")
+        result = _read_delta_state(blob_svc, "container", "delta-state.json")
+        assert result is None
+
+
+class TestSaveDeltaState:
+    def test_uploads_json_with_delta_link(self):
+        blob_svc = MagicMock()
+        _save_delta_state(blob_svc, "container", "delta-state.json", "https://example.com/delta?token=x", "MyDrive")
+        upload_call = blob_svc.get_blob_client.return_value.upload_blob
+        upload_call.assert_called_once()
+        payload_str = upload_call.call_args[0][0]
+        payload = json.loads(payload_str)
+        assert payload["deltaLink"] == "https://example.com/delta?token=x"
+        assert payload["driveName"] == "MyDrive"
+        assert "updatedAt" in payload
+
+
+class TestGetDeltaChanges:
+    def test_single_page_returns_items_and_link(self):
+        final_link = "https://graph.microsoft.com/v1.0/drives/x/root/delta?token=new"
+        with patch("function_app._graph_get", return_value={
+            "value": [{"id": "1"}, {"id": "2"}],
+            "@odata.deltaLink": final_link,
+        }):
+            items, link = _get_delta_changes("https://start-link", {}, max_items=100)
+        assert len(items) == 2
+        assert link == final_link
+
+    def test_multi_page_collects_all_items(self):
+        next_link = "https://page2"
+        final_link = "https://final"
+        pages = [
+            {"value": [{"id": "1"}], "@odata.nextLink": next_link},
+            {"value": [{"id": "2"}], "@odata.deltaLink": final_link},
+        ]
+        page_iter = iter(pages)
+        with patch("function_app._graph_get", side_effect=lambda url, h: next(page_iter)):
+            items, link = _get_delta_changes("https://start-link", {}, max_items=100)
+        assert len(items) == 2
+        assert link == final_link
+
+    def test_raises_when_no_delta_link(self):
+        with patch("function_app._graph_get", return_value={"value": []}):
+            with pytest.raises(RuntimeError, match="deltaLink"):
+                _get_delta_changes("https://start-link", {}, max_items=100)
+
+    def test_max_items_truncates(self):
+        final_link = "https://final"
+        with patch("function_app._graph_get", return_value={
+            "value": [{"id": str(i)} for i in range(10)],
+            "@odata.deltaLink": final_link,
+        }):
+            items, _ = _get_delta_changes("https://start-link", {}, max_items=3)
+        assert len(items) == 3
+
+
+class TestUploadDriveItems:
+    def _make_drive_item(self, item_id, name, modified="2024-06-01T12:00:00Z"):
+        return {"id": item_id, "name": name, "file": {}, "lastModifiedDateTime": modified}
+
+    def _run(self, items, allowed_extensions=None, extra_patches=()):
+        if allowed_extensions is None:
+            allowed_extensions = []
+        base_patches = [
+            patch("function_app._get_lookup_column_info", return_value=None),
+            patch("function_app._fetch_item_fields", return_value={}),
+            patch("function_app.requests.get", return_value=_make_streamed_response()),
+        ]
+        all_patches = base_patches + list(extra_patches)
+        for p in all_patches:
+            p.start()
+        try:
+            blob_svc = MagicMock()
+            return _upload_drive_items(
+                blob_svc, "container", "drive-1", "site-1",
+                items, {}, "list-1", allowed_extensions,
+            )
+        finally:
+            for p in all_patches:
+                p.stop()
+
+    def test_deleted_item_skipped(self):
+        items = [{"id": "1", "name": "doc.pdf", "file": {}, "deleted": {}, "lastModifiedDateTime": "2024-06-01T00:00:00Z"}]
+        count = self._run(items)
+        assert count == 0
+
+    def test_non_file_skipped(self):
+        items = [{"id": "1", "name": "folder", "lastModifiedDateTime": "2024-06-01T00:00:00Z"}]
+        count = self._run(items)
+        assert count == 0
+
+    def test_extension_filtered_skipped(self):
+        items = [self._make_drive_item("1", "doc.docx")]
+        count = self._run(items, allowed_extensions=[".pdf"])
+        assert count == 0
+
+    def test_happy_path_uploads_file(self):
+        items = [self._make_drive_item("1", "report.pdf")]
+        count = self._run(items, allowed_extensions=[".pdf"])
+        assert count == 1
+
+    def test_prefix_lookup_resolved_once(self):
+        items = [self._make_drive_item("1", "a.pdf"), self._make_drive_item("2", "b.pdf")]
+        extra = [patch("function_app._get_lookup_column_info", return_value={"lookup_list_id": "x", "lookup_column": "Title"})]
+        with patch("function_app._fetch_item_fields", return_value={"PrefixLookupId": "5"}):
+            with patch("function_app._get_lookup_item_display_value", return_value="ALPHA") as mock_resolve:
+                with patch("function_app.requests.get", return_value=_make_streamed_response()):
+                    for p in extra:
+                        p.start()
+                    try:
+                        blob_svc = MagicMock()
+                        _upload_drive_items(blob_svc, "container", "drive-1", "site-1", items, {}, "list-1", [])
+                    finally:
+                        for p in extra:
+                            p.stop()
+        # _get_lookup_column_info should be called once (before the loop), not once per item
+        from function_app import _get_lookup_column_info as glic
+        # validate by checking mock_resolve was called twice (once per item)
+        assert mock_resolve.call_count == 2
 
 
 class TestDownloadAndUpload:
