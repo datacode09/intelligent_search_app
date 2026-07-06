@@ -450,6 +450,63 @@ class TestDynamicMetadataInUpload:
         mock_sleep.assert_not_called()
 
 
+class TestPrefixLookupFallback:
+    """Verifies HODS-specific Prefix resolution and HODSContentType warning."""
+
+    def _run_upload(self, fields, extra_patches=()):
+        item = _make_item("1", "report.pdf", "2024-06-01T12:00:00Z")
+        base_patches = [
+            patch("function_app._get_drive_list_id", return_value="list-1"),
+            patch("function_app._list_all_items", return_value=[item]),
+            patch("function_app._fetch_item_fields", return_value=fields),
+            patch("function_app.requests.get", return_value=_make_streamed_response()),
+        ]
+        all_patches = base_patches + list(extra_patches)
+        for p in all_patches:
+            p.start()
+        try:
+            blob_service_client = MagicMock()
+            _upload_changed_files(
+                blob_service_client=blob_service_client,
+                container_name="ingest-output",
+                drive_id="drive-1",
+                site_id="site-1",
+                last_sync=datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
+                headers={},
+            )
+            return blob_service_client.get_blob_client.return_value.upload_blob.call_args[1]["metadata"]
+        finally:
+            for p in all_patches:
+                p.stop()
+
+    def test_prefix_display_value_used_when_present(self):
+        fields = {"HODSContentType": "Report", "PrefixLookupValue": "ALPHA"}
+        with patch("function_app._get_lookup_column_info") as mock_info:
+            written = self._run_upload(fields)
+        assert written.get("Prefix") == "ALPHA"
+        mock_info.assert_not_called()
+
+    def test_prefix_resolved_via_lookup_when_id_only(self):
+        fields = {"HODSContentType": "Report", "PrefixLookupId": "42"}
+        extra = [
+            patch(
+                "function_app._get_lookup_column_info",
+                return_value={"lookup_list_id": "lookup-list-1", "lookup_column": "Title"},
+            ),
+            patch("function_app._get_lookup_item_display_value", return_value="BETA"),
+        ]
+        written = self._run_upload(fields, extra_patches=extra)
+        assert written.get("Prefix") == "BETA"
+
+    def test_hods_content_type_missing_logs_warning(self):
+        fields = {"PrefixLookupValue": "GAMMA"}
+        with patch("function_app.logging.warning") as mock_warn:
+            written = self._run_upload(fields)
+        warned_calls = [str(c) for c in mock_warn.call_args_list]
+        assert any("HODSContentType" in c for c in warned_calls)
+        assert written.get("Prefix") == "GAMMA"
+
+
 class TestDownloadAndUpload:
     def test_happy_path_streams_chunks_into_upload_blob(self):
         response = _make_streamed_response(chunks=[b"abc", b"def"])

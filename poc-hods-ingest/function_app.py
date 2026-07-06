@@ -435,6 +435,27 @@ def _upload_changed_files(
             if blob_val:
                 metadata[blob_key] = blob_val
 
+        # HODS-specific: resolve Prefix display value when Graph returns only the lookup ID.
+        prefix_display = fields.get("PrefixLookupValue")
+        if prefix_display is None:
+            prefix_lookup_id = fields.get("PrefixLookupId")
+            if prefix_lookup_id is not None:
+                prefix_lookup_info = _get_lookup_column_info(site_id, list_id, "Prefix", headers)
+                if prefix_lookup_info is not None:
+                    prefix_display = _get_lookup_item_display_value(
+                        site_id,
+                        prefix_lookup_info["lookup_list_id"],
+                        prefix_lookup_id,
+                        prefix_lookup_info["lookup_column"],
+                        headers,
+                    )
+        if prefix_display is not None:
+            metadata["Prefix"] = _to_blob_metadata_value(prefix_display)
+
+        # HODS-specific: warn if HODSContentType column is absent.
+        if fields.get("HODSContentType") is None:
+            logging.warning("'HODSContentType' field not found for item %s", item_id)
+
         metadata = _trim_metadata(metadata, item_id)
         logging.info("Item %s metadata keys written: %s", item_id, sorted(metadata.keys()))
 
