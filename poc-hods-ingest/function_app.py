@@ -15,6 +15,7 @@ from azure.storage.blob import BlobServiceClient
 app = func.FunctionApp()
 
 DELTA_STATE_BLOB_NAME_DEFAULT = "hods-library-delta-state.json"
+GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 
 
 def _retry(call, attempts=3, base_delay=1.0, retry_on=(requests.exceptions.RequestException,)):
@@ -98,10 +99,10 @@ def _get_graph_token(tenant_id: str, client_id: str, client_secret: str) -> str:
     return access_token
 
 
-def _graph_get(url: str, headers: Dict[str, str]) -> Dict:
-    response = requests.get(url, headers=headers, timeout=60)
+def _graph_get(url: str, headers: Dict[str, str], timeout: int = 60) -> Dict:
+    response = requests.get(url, headers=headers, timeout=timeout)
     if not response.ok:
-        logging.error("Graph GET failed. URL=%s Body=%s", url, response.text)
+        logging.error("Graph GET %s -> %s Body=%s", url, response.status_code, response.text)
     response.raise_for_status()
     return response.json()
 
@@ -112,7 +113,7 @@ def _graph_get_with_params(url: str, headers: Dict[str, str], params: Dict) -> D
 
 
 def _get_site_id(hostname: str, site_path: str, headers: Dict[str, str]) -> str:
-    site_url = f"https://graph.microsoft.com/v1.0/sites/{hostname}:{site_path}"
+    site_url = f"{GRAPH_BASE_URL}/sites/{hostname}:{site_path}"
     site_json = _graph_get(site_url, headers)
     site_id = site_json.get("id")
     if not site_id:
@@ -132,7 +133,7 @@ def _normalize_drive_name(drive_name: str) -> str:
 
 
 def _get_drive_id(site_id: str, drive_name: str, headers: Dict[str, str]) -> str:
-    next_link = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives?$top=200"
+    next_link: Optional[str] = f"{GRAPH_BASE_URL}/sites/{site_id}/drives?$top=200"
     requested_drive_name = _normalize_drive_name(drive_name)
     candidate_drive: Optional[Dict] = None
     while next_link:
@@ -159,7 +160,7 @@ def _list_all_items(drive_id: str, headers: Dict[str, str]) -> Iterable[Dict]:
     queue: List[str] = ["root"]
     while queue:
         parent = queue.pop(0)
-        next_link = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{parent}/children?$top=200"
+        next_link: Optional[str] = f"{GRAPH_BASE_URL}/drives/{drive_id}/items/{parent}/children?$top=200"
         while next_link:
             children_page = _graph_get(next_link, headers)
             for item in children_page.get("value", []):
@@ -264,7 +265,7 @@ def _trim_metadata(metadata: Dict[str, str], item_id: str = "") -> Dict[str, str
 
 def _get_drive_list_id(drive_id: str, headers: Dict[str, str]) -> str:
     """Return the SharePoint list GUID for the document library behind a drive."""
-    url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/list"
+    url = f"{GRAPH_BASE_URL}/drives/{drive_id}/list"
     list_json = _graph_get(url, headers)
     list_id = list_json.get("id")
     if not list_id:
@@ -311,21 +312,25 @@ def _read_delta_state(blob_svc: BlobServiceClient, container: str, blob_name: st
 
 def _save_delta_state(
     blob_svc: BlobServiceClient,
-    container: str,
-    blob_name: str,
+    container_name: str,
     delta_link: str,
+    state_blob_name: str,
+    site_path: str,
     drive_name: str,
 ) -> None:
-    payload = json.dumps({
+    state = {
         "deltaLink": delta_link,
+        "updatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "sitePath": site_path,
         "driveName": drive_name,
-        "updatedAt": _to_utc_iso(datetime.datetime.now(datetime.timezone.utc)),
-    })
-    blob_svc.get_blob_client(container=container, blob=blob_name).upload_blob(payload, overwrite=True)
+    }
+    blob_svc.get_blob_client(container=container_name, blob=state_blob_name).upload_blob(
+        json.dumps(state), overwrite=True
+    )
 
 
 def _initialize_delta_tracking_latest(drive_id: str, headers: Dict[str, str]) -> str:
-    url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root/delta?token=latest"
+    url = f"{GRAPH_BASE_URL}/drives/{drive_id}/root/delta?token=latest"
     data = _graph_get(url, headers)
     delta_link = data.get("@odata.deltaLink")
     if not delta_link:
@@ -340,14 +345,26 @@ def _get_delta_changes(
 ) -> "Tuple[List[Dict], str]":
     changes: List[Dict] = []
     final_delta_link: Optional[str] = None
-    current_url: Optional[str] = delta_link
-    while current_url:
-        page = _graph_get(current_url, headers)
-        changes.extend(page.get("value", []))
-        final_delta_link = page.get("@odata.deltaLink")
-        current_url = page.get("@odata.nextLink") if not final_delta_link else None
+    url: Optional[str] = delta_link
+    while url:
+        data = _graph_get(url, headers)
+        page_items = data.get("value", [])
+        for item in page_items:
+            if len(changes) >= max_items:
+                logging.warning(
+                    "Delta result hit max_items cap: %s. Continuing to final deltaLink, but not appending more.",
+                    max_items,
+                )
+                break
+            changes.append(item)
+        new_delta_link = data.get("@odata.deltaLink")
+        if new_delta_link:
+            final_delta_link = new_delta_link
+            url = None
+        else:
+            url = data.get("@odata.nextLink")
     if not final_delta_link:
-        raise RuntimeError("Delta query did not return @odata.deltaLink")
+        raise RuntimeError("Delta query completed without a final @odata.deltaLink")
     return changes[:max_items], final_delta_link
 
 
@@ -361,14 +378,16 @@ def _list_recent_files_from_hods_list(
     max_files: int,
     allowed_extensions: List[str],
 ) -> List[Dict]:
-    cutoff_str = _to_utc_iso(cutoff)
-    url: Optional[str] = (
-        f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items"
-        f"?$expand=driveItem&$filter=fields/Modified ge '{cutoff_str}'&$top=200"
-    )
+    cutoff_text = _to_utc_iso(cutoff)
+    params = {
+        "$expand": "fields,driveItem($select=id,name,webUrl,lastModifiedDateTime,size,file,folder,parentReference)",
+        "$filter": f"fields/Modified ge '{cutoff_text}'",
+        "$top": "200",
+    }
+    base_url = f"{GRAPH_BASE_URL}/sites/{site_id}/lists/{list_id}/items"
     items: List[Dict] = []
-    while url and len(items) < max_files:
-        page = _graph_get(url, headers)
+    page = _graph_get_with_params(base_url, headers, params)
+    while True:
         for list_item in page.get("value", []):
             drive_item = list_item.get("driveItem") or {}
             name = drive_item.get("name", "")
@@ -377,8 +396,63 @@ def _list_recent_files_from_hods_list(
             if "file" not in drive_item:
                 continue
             items.append(drive_item)
-        url = page.get("@odata.nextLink")
+            if len(items) >= max_files:
+                return items[:max_files]
+        next_url = page.get("@odata.nextLink")
+        if not next_url:
+            break
+        page = _graph_get(next_url, headers)
     return items[:max_files]
+
+
+def _build_blob_metadata(
+    drive_id: str,
+    item_id: str,
+    site_id: str,
+    list_id: str,
+    modified_raw: Optional[str],
+    prefix_lookup_info: Optional[Dict[str, str]],
+    headers: Dict[str, str],
+) -> Dict[str, str]:
+    # Fields handled explicitly below — skip in the generic loop to avoid duplicates.
+    _EXPLICIT_FIELDS = frozenset({"HODSContentType", "PrefixLookupValue", "PrefixLookupId"})
+
+    metadata: Dict[str, str] = {}
+    metadata["Modified"] = _to_blob_metadata_value(modified_raw)
+    fields = _fetch_item_fields(drive_id, item_id, site_id, list_id, headers)
+    # Write ALL non-system SharePoint fields as blob metadata.
+    for key, value in fields.items():
+        if _is_system_field(key):
+            continue
+        if key in _EXPLICIT_FIELDS:
+            continue
+        blob_key = _sanitize_metadata_key(key)
+        blob_val = _to_blob_metadata_value(value)
+        if blob_val:
+            metadata[blob_key] = blob_val
+    # Prefix: use display value if present, else resolve from lookup list.
+    prefix_raw = fields.get("PrefixLookupValue")
+    if prefix_raw is None:
+        prefix_lookup_id = fields.get("PrefixLookupId")
+        if prefix_lookup_id is not None and prefix_lookup_info is not None:
+            prefix_raw = _get_lookup_item_display_value(
+                site_id,
+                prefix_lookup_info["lookup_list_id"],
+                prefix_lookup_id,
+                prefix_lookup_info["lookup_column"],
+                headers,
+            )
+    if prefix_raw is not None:
+        metadata["Prefix"] = _to_blob_metadata_value(prefix_raw)
+    else:
+        logging.warning("Could not resolve Prefix display value for item %s", item_id)
+    # HODSContentType → stored as "ContentType" key.
+    hods_content_type_raw = fields.get("HODSContentType")
+    if hods_content_type_raw is not None:
+        metadata["ContentType"] = _to_blob_metadata_value(hods_content_type_raw)
+    else:
+        logging.warning("'HODSContentType' field not found for item %s", item_id)
+    return metadata
 
 
 def _upload_drive_items(
@@ -405,13 +479,15 @@ def _upload_drive_items(
         if not item_id:
             continue
         modified_raw = item.get("lastModifiedDateTime", "")
-        content_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content"
+        content_url = f"{GRAPH_BASE_URL}/drives/{drive_id}/items/{item_id}/content"
         blob_name = _to_blob_name(name)
         blob_client = blob_svc.get_blob_client(container=container, blob=blob_name)
-        fields = _fetch_item_fields(drive_id, item_id, site_id, list_id, headers)
 
-        metadata: Dict[str, str] = {}
-        metadata["Modified"] = _to_blob_metadata_value(modified_raw)
+        metadata = _build_blob_metadata(
+            drive_id, item_id, site_id, list_id, modified_raw, prefix_lookup_info, headers
+        )
+
+        # Native drive item properties not available inside _build_blob_metadata.
         _created_raw = item.get("createdDateTime")
         if _created_raw:
             metadata["Created"] = _to_blob_metadata_value(_created_raw)
@@ -425,32 +501,6 @@ def _upload_drive_items(
         if _modified_by:
             metadata["ModifiedBy"] = _to_blob_metadata_value(_modified_by)
 
-        for key, value in fields.items():
-            if _is_system_field(key):
-                continue
-            blob_key = _sanitize_metadata_key(key)
-            blob_val = _to_blob_metadata_value(value)
-            if blob_val:
-                metadata[blob_key] = blob_val
-
-        # HODS-specific: resolve Prefix display value when Graph returns only the lookup ID.
-        prefix_display = fields.get("PrefixLookupValue")
-        if prefix_display is None:
-            prefix_lookup_id = fields.get("PrefixLookupId")
-            if prefix_lookup_id is not None and prefix_lookup_info is not None:
-                prefix_display = _get_lookup_item_display_value(
-                    site_id,
-                    prefix_lookup_info["lookup_list_id"],
-                    prefix_lookup_id,
-                    prefix_lookup_info["lookup_column"],
-                    headers,
-                )
-        if prefix_display is not None:
-            metadata["Prefix"] = _to_blob_metadata_value(prefix_display)
-
-        if fields.get("HODSContentType") is None:
-            logging.warning("'HODSContentType' field not found for item %s", item_id)
-
         metadata = _trim_metadata(metadata, item_id)
         logging.info("Item %s metadata keys written: %s", item_id, sorted(metadata.keys()))
         _retry(lambda: _download_and_upload(content_url, headers, blob_client, metadata))
@@ -460,7 +510,7 @@ def _upload_drive_items(
 
 def _get_lookup_column_info(site_id: str, list_id: str, column_name: str, headers: Dict[str, str]) -> Optional[Dict[str, str]]:
     """Return lookup metadata (target list + target column) for a list column."""
-    columns_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/columns?$select=name,displayName,lookup"
+    columns_url = f"{GRAPH_BASE_URL}/sites/{site_id}/lists/{list_id}/columns?$select=name,displayName,lookup"
     columns_json = _graph_get(columns_url, headers)
     target = (column_name or "").strip().lower()
 
@@ -503,7 +553,7 @@ def _get_lookup_item_display_value(
 
     select = f"{lookup_column},Title,Name"
     lookup_url = (
-        f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{lookup_list_id}"
+        f"{GRAPH_BASE_URL}/sites/{site_id}/lists/{lookup_list_id}"
         f"/items/{lookup_item_id_text}?$expand=fields($select={select})"
     )
 
@@ -535,7 +585,7 @@ def _fetch_item_fields(
     """
     # Step 1: resolve the SharePoint list item integer ID from the drive item.
     sp_id_url = (
-        f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}"
+        f"{GRAPH_BASE_URL}/drives/{drive_id}/items/{item_id}"
         f"?$expand=listItem($select=id)"
     )
     sp_id_json = _graph_get(sp_id_url, headers)
@@ -548,7 +598,7 @@ def _fetch_item_fields(
     # library is returned, including lookup display values that the drive-based
     # endpoint omits.
     fields_url = (
-        f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}"
+        f"{GRAPH_BASE_URL}/sites/{site_id}/lists/{list_id}"
         f"/items/{sp_item_id}?$expand=fields"
     )
     fields_json = _graph_get(fields_url, headers)
@@ -594,7 +644,7 @@ def _upload_changed_files(
         if not item_id or not file_name:
             continue
 
-        content_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content"
+        content_url = f"{GRAPH_BASE_URL}/drives/{drive_id}/items/{item_id}/content"
 
         blob_name = _to_blob_name(file_name)
         blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
@@ -743,6 +793,9 @@ def Ingest(myTimer: func.TimerRequest) -> None:
         drive_id = _get_drive_id(site_id, drive_name, headers)
         list_id = _get_drive_list_id(drive_id, headers)
 
+        logging.info("Resolved source: Site ID=%s Drive Name=%s Drive ID=%s List ID=%s", site_id, drive_name, drive_id, list_id)
+        logging.info("Allowed extensions: %s", allowed_extensions)
+
         existing_delta_link = _read_delta_state(blob_service_client, container_name, delta_state_blob_name)
 
         if existing_delta_link is None:
@@ -758,7 +811,7 @@ def Ingest(myTimer: func.TimerRequest) -> None:
                 recent_items, headers, list_id, allowed_extensions,
             )
             new_delta_link = _initialize_delta_tracking_latest(drive_id, headers)
-            _save_delta_state(blob_service_client, container_name, delta_state_blob_name, new_delta_link, drive_name)
+            _save_delta_state(blob_service_client, container_name, new_delta_link, delta_state_blob_name, site_path, drive_name)
             logging.info("First-run ingestion completed. Recent files uploaded: %s", uploaded_count)
         else:
             # Incremental run: fetch only changed items since last delta.
@@ -768,7 +821,7 @@ def Ingest(myTimer: func.TimerRequest) -> None:
                 blob_service_client, container_name, drive_id, site_id,
                 raw_delta_items, headers, list_id, allowed_extensions,
             )
-            _save_delta_state(blob_service_client, container_name, delta_state_blob_name, refreshed_delta_link, drive_name)
+            _save_delta_state(blob_service_client, container_name, refreshed_delta_link, delta_state_blob_name, site_path, drive_name)
             logging.info("Ingestion completed. Files uploaded: %s", uploaded_count)
 
     except Exception as exc:

@@ -8,6 +8,7 @@ import pytest
 import requests
 
 from function_app import (
+    _build_blob_metadata,
     _download_and_upload,
     _get_allowed_extensions,
     _get_delta_changes,
@@ -584,13 +585,20 @@ class TestReadDeltaState:
 class TestSaveDeltaState:
     def test_uploads_json_with_delta_link(self):
         blob_svc = MagicMock()
-        _save_delta_state(blob_svc, "container", "delta-state.json", "https://example.com/delta?token=x", "MyDrive")
+        _save_delta_state(
+            blob_svc,
+            "container",
+            "https://example.com/delta?token=x",
+            "delta-state.json",
+            "/sites/HODS",
+            "MyDrive",
+        )
         upload_call = blob_svc.get_blob_client.return_value.upload_blob
         upload_call.assert_called_once()
-        payload_str = upload_call.call_args[0][0]
-        payload = json.loads(payload_str)
+        payload = json.loads(upload_call.call_args[0][0])
         assert payload["deltaLink"] == "https://example.com/delta?token=x"
         assert payload["driveName"] == "MyDrive"
+        assert payload["sitePath"] == "/sites/HODS"
         assert "updatedAt" in payload
 
 
@@ -696,6 +704,76 @@ class TestUploadDriveItems:
         from function_app import _get_lookup_column_info as glic
         # validate by checking mock_resolve was called twice (once per item)
         assert mock_resolve.call_count == 2
+
+
+class TestBuildBlobMetadata:
+    def _run(self, fields, prefix_lookup_info=None, extra_patches=()):
+        base_patches = [
+            patch("function_app._fetch_item_fields", return_value=fields),
+            patch("function_app._get_lookup_item_display_value", return_value=None),
+        ]
+        all_patches = base_patches + list(extra_patches)
+        for p in all_patches:
+            p.start()
+        try:
+            return _build_blob_metadata(
+                "drive-1", "item-1", "site-1", "list-1",
+                "2024-06-01T12:00:00Z", prefix_lookup_info, {},
+            )
+        finally:
+            for p in all_patches:
+                p.stop()
+
+    def test_modified_always_set(self):
+        result = self._run({})
+        assert result.get("Modified") == "2024-06-01T12:00:00Z"
+
+    def test_all_sp_fields_written(self):
+        fields = {"CustomCol": "value1", "AnotherCol": "value2"}
+        result = self._run(fields)
+        assert "CustomCol" in result
+        assert "AnotherCol" in result
+
+    def test_system_fields_skipped(self):
+        fields = {
+            "@odata.etag": "etag",
+            "_UIVersionString": "512",
+            "FileRef": "/sites/x",
+            "CustomCol": "keep",
+        }
+        result = self._run(fields)
+        assert "@odata.etag" not in result  # noqa: S105
+        assert "_UIVersionString" not in result
+        assert "FileRef" not in result
+        assert "CustomCol" in result
+
+    def test_prefix_direct_value(self):
+        fields = {"PrefixLookupValue": "ALPHA", "HODSContentType": "Report"}
+        with patch("function_app._get_lookup_item_display_value") as mock_resolve:
+            result = self._run(fields)
+        assert result.get("Prefix") == "ALPHA"
+        mock_resolve.assert_not_called()
+
+    def test_prefix_resolved_via_lookup(self):
+        fields = {"PrefixLookupId": "42", "HODSContentType": "Report"}
+        prefix_info = {"lookup_list_id": "lookup-list-1", "lookup_column": "Title"}
+        extra = [patch("function_app._get_lookup_item_display_value", return_value="BETA")]
+        result = self._run(fields, prefix_lookup_info=prefix_info, extra_patches=extra)
+        assert result.get("Prefix") == "BETA"
+
+    def test_hods_content_type_stored_as_content_type_key(self):
+        fields = {"HODSContentType": "Report", "PrefixLookupValue": "X"}
+        result = self._run(fields)
+        assert result.get("ContentType") == "Report"
+        assert "HODSContentType" not in result
+
+    def test_hods_content_type_missing_logs_warning(self):
+        fields = {"PrefixLookupValue": "X"}
+        with patch("function_app.logging.warning") as mock_warn:
+            result = self._run(fields)
+        warned_calls = [str(c) for c in mock_warn.call_args_list]
+        assert any("HODSContentType" in c for c in warned_calls)
+        assert "ContentType" not in result
 
 
 class TestDownloadAndUpload:
