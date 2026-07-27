@@ -16,6 +16,8 @@ from function_app import (
     _get_delta_changes,
     _is_allowed_file_name,
     _is_system_field,
+    _list_all_files_from_hods_list,
+    _parse_historical_date_param,
     _parse_last_sync,
     _read_delta_state,
     _retry,
@@ -906,3 +908,189 @@ class TestDownloadAndUpload:
             blob_client = MagicMock()
             with pytest.raises(requests.exceptions.RequestException):
                 _download_and_upload("http://example/content", {}, blob_client, None)
+
+
+class TestListAllFilesFromHodsList:
+    def _make_list_item(self, item_id, name, modified="2024-01-01T00:00:00Z"):
+        return {
+            "driveItem": {
+                "id": item_id,
+                "name": name,
+                "file": {},
+                "lastModifiedDateTime": modified,
+            }
+        }
+
+    def test_returns_all_files_when_no_date_filter(self):
+        page = {
+            "value": [
+                self._make_list_item("1", "a.pdf"),
+                self._make_list_item("2", "b.pdf"),
+            ]
+        }
+        with patch("function_app._graph_get_with_params", return_value=page):
+            result = _list_all_files_from_hods_list("site-1", "list-1", {}, [])
+        assert len(result) == 2
+
+    def test_start_date_filter_added_to_params(self):
+        start = datetime.datetime(2023, 1, 1, tzinfo=datetime.timezone.utc)
+        page = {"value": []}
+        with patch("function_app._graph_get_with_params", return_value=page) as mock_get:
+            _list_all_files_from_hods_list("site-1", "list-1", {}, [], start_date=start)
+        _, called_params = mock_get.call_args[0][0], mock_get.call_args[0][2]
+        assert "fields/Modified ge" in called_params.get("$filter", "")
+
+    def test_end_date_filter_added_to_params(self):
+        end = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+        page = {"value": []}
+        with patch("function_app._graph_get_with_params", return_value=page) as mock_get:
+            _list_all_files_from_hods_list("site-1", "list-1", {}, [], end_date=end)
+        called_params = mock_get.call_args[0][2]
+        assert "fields/Modified le" in called_params.get("$filter", "")
+
+    def test_both_dates_combined_with_and(self):
+        start = datetime.datetime(2023, 1, 1, tzinfo=datetime.timezone.utc)
+        end = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        page = {"value": []}
+        with patch("function_app._graph_get_with_params", return_value=page) as mock_get:
+            _list_all_files_from_hods_list("site-1", "list-1", {}, [], start_date=start, end_date=end)
+        called_params = mock_get.call_args[0][2]
+        f = called_params.get("$filter", "")
+        assert "ge" in f and "le" in f and " and " in f
+
+    def test_no_date_filter_means_no_filter_param(self):
+        page = {"value": []}
+        with patch("function_app._graph_get_with_params", return_value=page) as mock_get:
+            _list_all_files_from_hods_list("site-1", "list-1", {}, [])
+        called_params = mock_get.call_args[0][2]
+        assert "$filter" not in called_params
+
+    def test_extension_filter_applied(self):
+        page = {
+            "value": [
+                self._make_list_item("1", "a.pdf"),
+                self._make_list_item("2", "b.docx"),
+            ]
+        }
+        with patch("function_app._graph_get_with_params", return_value=page):
+            result = _list_all_files_from_hods_list("site-1", "list-1", {}, [".pdf"])
+        assert len(result) == 1
+        assert result[0]["name"] == "a.pdf"
+
+    def test_folders_skipped(self):
+        page = {
+            "value": [
+                {"driveItem": {"id": "1", "name": "folder", "folder": {}}},
+                self._make_list_item("2", "doc.pdf"),
+            ]
+        }
+        with patch("function_app._graph_get_with_params", return_value=page):
+            result = _list_all_files_from_hods_list("site-1", "list-1", {}, [])
+        assert len(result) == 1
+
+    def test_max_files_cap_respected(self):
+        page = {"value": [self._make_list_item(str(i), f"{i}.pdf") for i in range(10)]}
+        with patch("function_app._graph_get_with_params", return_value=page):
+            result = _list_all_files_from_hods_list("site-1", "list-1", {}, [], max_files=3)
+        assert len(result) == 3
+
+    def test_pagination_followed(self):
+        page1 = {
+            "value": [self._make_list_item("1", "a.pdf")],
+            "@odata.nextLink": "https://next-page",
+        }
+        page2 = {"value": [self._make_list_item("2", "b.pdf")]}
+        with patch("function_app._graph_get_with_params", return_value=page1):
+            with patch("function_app._graph_get", return_value=page2):
+                result = _list_all_files_from_hods_list("site-1", "list-1", {}, [])
+        assert len(result) == 2
+
+
+class TestParseHistoricalDateParam:
+    def test_valid_iso_returns_datetime(self):
+        result = _parse_historical_date_param("2023-01-01T00:00:00Z", "start_date")
+        assert result is not None
+        assert result.year == 2023
+
+    def test_none_returns_none(self):
+        assert _parse_historical_date_param(None, "start_date") is None
+
+    def test_empty_string_returns_none(self):
+        assert _parse_historical_date_param("", "start_date") is None
+
+    def test_invalid_string_returns_none_and_warns(self):
+        with patch("function_app.logging.warning") as mock_warn:
+            result = _parse_historical_date_param("not-a-date", "start_date")
+        assert result is None
+        assert mock_warn.call_count >= 1
+        warned_calls = [str(c) for c in mock_warn.call_args_list]
+        assert any("could not parse" in c for c in warned_calls)
+
+
+class TestIngestHistoricalEndpoint:
+    """Smoke-tests for the IngestHistorical HTTP function handler."""
+
+    def _env(self):
+        return {
+            "BLOB_STORAGE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=fake;AccountKey=ZmFrZWtleQ==;EndpointSuffix=core.windows.net",
+            "SHAREPOINT_TENANT_ID": "tenant",
+            "SHAREPOINT_CLIENT_ID": "client",
+            "SHAREPOINT_CLIENT_SECRET": "secret",
+            "SHAREPOINT_SITE_HOSTNAME": "contoso.sharepoint.com",
+            "SHAREPOINT_SITE_PATH": "/sites/HODS",
+        }
+
+    def _make_request(self, params=None):
+        req = MagicMock()
+        req.params = params or {}
+        return req
+
+    def test_missing_connection_string_returns_500(self):
+        from function_app import IngestHistorical
+        req = self._make_request()
+        with patch.dict("os.environ", {}, clear=True):
+            response = IngestHistorical(req)
+        assert response.status_code == 500
+        assert "BLOB_STORAGE_CONNECTION_STRING" in response.get_body().decode()
+
+    def test_invalid_max_files_returns_400(self):
+        from function_app import IngestHistorical
+        req = self._make_request(params={"max_files": "not-a-number"})
+        with patch.dict("os.environ", self._env()):
+            response = IngestHistorical(req)
+        assert response.status_code == 400
+
+    def test_successful_run_returns_200_with_uploaded_count(self):
+        from function_app import IngestHistorical
+        req = self._make_request(params={"start_date": "2023-01-01T00:00:00Z"})
+        with patch.dict("os.environ", self._env()):
+            with patch("function_app.BlobServiceClient") as mock_bsc:
+                mock_bsc.from_connection_string.return_value = MagicMock()
+                with patch("function_app._get_graph_token", return_value="tok"):
+                    with patch("function_app._resolve_site_id", return_value="site-1"):
+                        with patch("function_app._get_drive_id", return_value="drive-1"):
+                            with patch("function_app._get_drive_list_id", return_value="list-1"):
+                                with patch("function_app._list_all_files_from_hods_list", return_value=[]):
+                                    with patch("function_app._upload_drive_items", return_value=0):
+                                        response = IngestHistorical(req)
+        assert response.status_code == 200
+        body = json.loads(response.get_body())
+        assert "uploaded" in body
+        assert body["start_date"] == "2023-01-01T00:00:00+00:00"
+
+    def test_delta_state_blob_is_not_touched(self):
+        from function_app import IngestHistorical
+        req = self._make_request()
+        with patch.dict("os.environ", self._env()):
+            with patch("function_app.BlobServiceClient") as mock_bsc:
+                blob_svc = MagicMock()
+                mock_bsc.from_connection_string.return_value = blob_svc
+                with patch("function_app._get_graph_token", return_value="tok"):
+                    with patch("function_app._resolve_site_id", return_value="site-1"):
+                        with patch("function_app._get_drive_id", return_value="drive-1"):
+                            with patch("function_app._get_drive_list_id", return_value="list-1"):
+                                with patch("function_app._list_all_files_from_hods_list", return_value=[]):
+                                    with patch("function_app._upload_drive_items", return_value=0):
+                                        with patch("function_app._save_delta_state") as mock_save:
+                                            IngestHistorical(req)
+        mock_save.assert_not_called()

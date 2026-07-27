@@ -889,3 +889,169 @@ def Ingest(myTimer: func.TimerRequest) -> None:
 
     except Exception as exc:
         logging.exception("Failed to sync SharePoint files: %s", exc)
+
+
+def _list_all_files_from_hods_list(
+    site_id: str,
+    list_id: str,
+    headers: Dict[str, str],
+    allowed_extensions: List[str],
+    start_date: Optional[datetime.datetime] = None,
+    end_date: Optional[datetime.datetime] = None,
+    max_files: int = 5000,
+) -> List[Dict]:
+    """Return all drive items from a SharePoint list, with optional date-range filter.
+
+    Unlike _list_recent_files_from_hods_list (which always requires a cutoff),
+    this function defaults to the full library when no dates are given — intended
+    for one-off historical loads.
+    """
+    params: Dict[str, str] = {
+        "$expand": "fields,driveItem($select=id,name,webUrl,lastModifiedDateTime,size,file,folder,parentReference)",
+        "$top": "200",
+    }
+    date_filters: List[str] = []
+    if start_date:
+        date_filters.append(f"fields/Modified ge '{_to_utc_iso(start_date)}'")
+    if end_date:
+        date_filters.append(f"fields/Modified le '{_to_utc_iso(end_date)}'")
+    if date_filters:
+        params["$filter"] = " and ".join(date_filters)
+
+    base_url = f"{GRAPH_BASE_URL}/sites/{site_id}/lists/{list_id}/items"
+    items: List[Dict] = []
+    page = _graph_get_with_params(base_url, headers, params)
+    while True:
+        for list_item in page.get("value", []):
+            drive_item = list_item.get("driveItem") or {}
+            name = drive_item.get("name", "")
+            if not _is_allowed_file_name(name, allowed_extensions):
+                continue
+            if "file" not in drive_item:
+                continue
+            items.append(drive_item)
+            if len(items) >= max_files:
+                return items[:max_files]
+        next_url = page.get("@odata.nextLink")
+        if not next_url:
+            break
+        page = _graph_get(next_url, headers)
+    return items[:max_files]
+
+
+def _parse_historical_date_param(value: Optional[str], name: str) -> Optional[datetime.datetime]:
+    """Parse a date string from an HTTP query parameter; log a 400-level warning on bad input."""
+    if not value:
+        return None
+    dt = _parse_last_sync(value)
+    if dt == _EPOCH:
+        logging.warning("Historical ingest: could not parse '%s' param '%s'; ignoring.", name, value)
+        return None
+    return dt
+
+
+@app.route(route="IngestHistorical", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def IngestHistorical(req: func.HttpRequest) -> func.HttpResponse:
+    """HTTP-triggered function for one-off historical data loads.
+
+    Query parameters (all optional):
+      start_date  ISO-8601 string — only ingest files modified on or after this date.
+      end_date    ISO-8601 string — only ingest files modified on or before this date.
+      max_files   Integer cap on files processed in this call (default: HISTORICAL_MAX_FILES
+                  env var, or 5000).
+
+    Returns a JSON body with { "uploaded": N, "start_date": ..., "end_date": ... }.
+    Does NOT modify the delta-state blob used by the incremental Ingest timer function.
+    """
+    logging.info("IngestHistorical triggered")
+
+    blob_connection_string = os.getenv("BLOB_STORAGE_CONNECTION_STRING")
+    container_name = os.getenv("BLOB_CONTAINER_NAME", "ingest-output")
+    tenant_id = os.getenv("SHAREPOINT_TENANT_ID")
+    client_id = os.getenv("SHAREPOINT_CLIENT_ID")
+    client_secret = os.getenv("SHAREPOINT_CLIENT_SECRET")
+    site_hostname = os.getenv("SHAREPOINT_SITE_HOSTNAME")
+    site_path = os.getenv("SHAREPOINT_SITE_PATH")
+    site_id_override = os.getenv("SHAREPOINT_SITE_ID")
+    drive_name = os.getenv("SHAREPOINT_LIBRARY_DRIVE_NAME", "Documents")
+    allowed_extensions = _get_allowed_extensions()
+
+    default_max = int(os.getenv("HISTORICAL_MAX_FILES", "5000"))
+    try:
+        max_files = int(req.params.get("max_files") or default_max)
+    except ValueError:
+        return func.HttpResponse(
+            json.dumps({"error": "max_files must be an integer"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    start_date = _parse_historical_date_param(req.params.get("start_date"), "start_date")
+    end_date = _parse_historical_date_param(req.params.get("end_date"), "end_date")
+
+    if not blob_connection_string:
+        return func.HttpResponse(
+            json.dumps({"error": "Missing app setting: BLOB_STORAGE_CONNECTION_STRING"}),
+            status_code=500,
+            mimetype="application/json",
+        )
+
+    required = {
+        "SHAREPOINT_TENANT_ID": tenant_id,
+        "SHAREPOINT_CLIENT_ID": client_id,
+        "SHAREPOINT_CLIENT_SECRET": client_secret,
+        "SHAREPOINT_SITE_HOSTNAME": site_hostname,
+        "SHAREPOINT_SITE_PATH": site_path,
+    }
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        return func.HttpResponse(
+            json.dumps({"error": f"Missing app settings: {', '.join(missing)}"}),
+            status_code=500,
+            mimetype="application/json",
+        )
+
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(blob_connection_string)
+        _ensure_container(blob_service_client, container_name)
+
+        token = _get_graph_token(tenant_id, client_id, client_secret)
+        headers = {"Authorization": f"Bearer {token}"}
+        site_id = _resolve_site_id(site_hostname, site_path, headers, site_id_override)
+        drive_id = _get_drive_id(site_id, drive_name, headers)
+        list_id = _get_drive_list_id(drive_id, headers)
+
+        logging.info(
+            "Historical ingest: site=%s drive=%s list=%s start=%s end=%s max=%s",
+            site_id, drive_id, list_id,
+            start_date.isoformat() if start_date else "none",
+            end_date.isoformat() if end_date else "none",
+            max_files,
+        )
+
+        items = _list_all_files_from_hods_list(
+            site_id, list_id, headers, allowed_extensions,
+            start_date=start_date, end_date=end_date, max_files=max_files,
+        )
+        logging.info("Historical ingest: %s files found, uploading…", len(items))
+
+        uploaded_count = _upload_drive_items(
+            blob_service_client, container_name, drive_id, site_id,
+            items, headers, list_id, allowed_extensions,
+        )
+
+        result = {
+            "uploaded": uploaded_count,
+            "start_date": start_date.isoformat() if start_date else None,
+            "end_date": end_date.isoformat() if end_date else None,
+        }
+        logging.info("Historical ingest complete: %s", result)
+        return func.HttpResponse(json.dumps(result), status_code=200, mimetype="application/json")
+
+    except Exception as exc:
+        logging.exception("Historical ingest failed: %s", exc)
+        return func.HttpResponse(
+            json.dumps({"error": str(exc)}),
+            status_code=500,
+            mimetype="application/json",
+        )
