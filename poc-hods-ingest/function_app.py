@@ -1,5 +1,6 @@
 import azure.functions as func
 import datetime
+import io
 import json
 import logging
 import os
@@ -8,6 +9,7 @@ import time
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlencode
 
+import pypdf
 import requests
 
 from azure.storage.blob import BlobServiceClient
@@ -455,6 +457,60 @@ def _build_blob_metadata(
     return metadata
 
 
+_PURPOSE_HEADING_RE = re.compile(
+    r"(?im)^[ \t]*(?:\d[\d.]*\.?\s+)?(?:purpose(?:\s+(?:and|&)\s+scope)?|scope)[ \t]*$"
+)
+_NEXT_HEADING_RE = re.compile(
+    r"(?im)^[ \t]*(?:\d[\d.]*\.?\s+[A-Za-z]|[A-Z][A-Z\s]{4,})[ \t]*$"
+)
+
+
+def _fetch_content(content_url: str, headers: Dict[str, str], timeout: int = 120) -> bytes:
+    """Download file content into memory and return as bytes."""
+    with requests.get(content_url, headers=headers, stream=True, timeout=timeout) as r:
+        r.raise_for_status()
+        return b"".join(r.iter_content(chunk_size=4 * 1024 * 1024))
+
+
+def _extract_purpose_and_scope(pdf_bytes: bytes) -> Optional[str]:
+    """Return the body of the Purpose/Scope section from a PDF, or the document title as fallback."""
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+    except Exception as exc:
+        logging.warning("pypdf: could not read PDF for section extraction: %s", exc)
+        return None
+
+    max_pages = min(5, len(reader.pages))
+    page_texts: List[str] = []
+    for i in range(max_pages):
+        try:
+            page_texts.append(reader.pages[i].extract_text() or "")
+        except Exception:
+            page_texts.append("")
+    full_text = "\n".join(page_texts)
+
+    heading_match = _PURPOSE_HEADING_RE.search(full_text)
+    if heading_match:
+        body_start = heading_match.end()
+        next_match = _NEXT_HEADING_RE.search(full_text, body_start)
+        body = full_text[body_start: next_match.start() if next_match else len(full_text)]
+        body = body.strip()
+        if body:
+            return body
+
+    # Fallback: PDF document title from metadata
+    try:
+        info = reader.metadata
+        if info:
+            title = str(info.get("/Title") or info.get("Title") or "").strip()
+            if title:
+                return title
+    except Exception:
+        pass
+
+    return None
+
+
 def _upload_drive_items(
     blob_svc: BlobServiceClient,
     container: str,
@@ -501,9 +557,16 @@ def _upload_drive_items(
         if _modified_by:
             metadata["ModifiedBy"] = _to_blob_metadata_value(_modified_by)
 
+        # Download to memory so PDF text can be extracted before we upload.
+        raw_bytes = _retry(lambda: _fetch_content(content_url, headers))
+        if name.lower().endswith(".pdf"):
+            extracted = _extract_purpose_and_scope(raw_bytes)
+            if extracted:
+                metadata["Purpose_and_Scope"] = _to_blob_metadata_value(extracted)
+
         metadata = _trim_metadata(metadata, item_id)
         logging.info("Item %s metadata keys written: %s", item_id, sorted(metadata.keys()))
-        _retry(lambda: _download_and_upload(content_url, headers, blob_client, metadata))
+        _retry(lambda: blob_client.upload_blob(raw_bytes, overwrite=True, metadata=metadata or None))
         uploaded += 1
     return uploaded
 

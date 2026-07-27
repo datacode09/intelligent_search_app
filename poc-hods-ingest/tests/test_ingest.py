@@ -10,6 +10,8 @@ import requests
 from function_app import (
     _build_blob_metadata,
     _download_and_upload,
+    _extract_purpose_and_scope,
+    _fetch_content,
     _get_allowed_extensions,
     _get_delta_changes,
     _is_allowed_file_name,
@@ -652,38 +654,40 @@ class TestUploadDriveItems:
             patch("function_app._get_lookup_column_info", return_value=None),
             patch("function_app._fetch_item_fields", return_value={}),
             patch("function_app.requests.get", return_value=_make_streamed_response()),
+            patch("function_app._extract_purpose_and_scope", return_value=None),
         ]
         all_patches = base_patches + list(extra_patches)
         for p in all_patches:
             p.start()
         try:
             blob_svc = MagicMock()
-            return _upload_drive_items(
+            count = _upload_drive_items(
                 blob_svc, "container", "drive-1", "site-1",
                 items, {}, "list-1", allowed_extensions,
             )
+            return count, blob_svc
         finally:
             for p in all_patches:
                 p.stop()
 
     def test_deleted_item_skipped(self):
         items = [{"id": "1", "name": "doc.pdf", "file": {}, "deleted": {}, "lastModifiedDateTime": "2024-06-01T00:00:00Z"}]
-        count = self._run(items)
+        count, _ = self._run(items)
         assert count == 0
 
     def test_non_file_skipped(self):
         items = [{"id": "1", "name": "folder", "lastModifiedDateTime": "2024-06-01T00:00:00Z"}]
-        count = self._run(items)
+        count, _ = self._run(items)
         assert count == 0
 
     def test_extension_filtered_skipped(self):
         items = [self._make_drive_item("1", "doc.docx")]
-        count = self._run(items, allowed_extensions=[".pdf"])
+        count, _ = self._run(items, allowed_extensions=[".pdf"])
         assert count == 0
 
     def test_happy_path_uploads_file(self):
         items = [self._make_drive_item("1", "report.pdf")]
-        count = self._run(items, allowed_extensions=[".pdf"])
+        count, _ = self._run(items, allowed_extensions=[".pdf"])
         assert count == 1
 
     def test_prefix_lookup_resolved_once(self):
@@ -692,18 +696,36 @@ class TestUploadDriveItems:
         with patch("function_app._fetch_item_fields", return_value={"PrefixLookupId": "5"}):
             with patch("function_app._get_lookup_item_display_value", return_value="ALPHA") as mock_resolve:
                 with patch("function_app.requests.get", return_value=_make_streamed_response()):
-                    for p in extra:
-                        p.start()
-                    try:
-                        blob_svc = MagicMock()
-                        _upload_drive_items(blob_svc, "container", "drive-1", "site-1", items, {}, "list-1", [])
-                    finally:
+                    with patch("function_app._extract_purpose_and_scope", return_value=None):
                         for p in extra:
-                            p.stop()
-        # _get_lookup_column_info should be called once (before the loop), not once per item
-        from function_app import _get_lookup_column_info as glic
+                            p.start()
+                        try:
+                            blob_svc = MagicMock()
+                            _upload_drive_items(blob_svc, "container", "drive-1", "site-1", items, {}, "list-1", [])
+                        finally:
+                            for p in extra:
+                                p.stop()
         # validate by checking mock_resolve was called twice (once per item)
         assert mock_resolve.call_count == 2
+
+    def test_purpose_and_scope_added_to_pdf_metadata(self):
+        items = [self._make_drive_item("1", "report.pdf")]
+        extracted_text = "This document defines the scope of the HODS project."
+        extra = [patch("function_app._extract_purpose_and_scope", return_value=extracted_text)]
+        count, blob_svc = self._run(items, extra_patches=extra)
+        assert count == 1
+        call_kwargs = blob_svc.get_blob_client.return_value.upload_blob.call_args[1]
+        assert call_kwargs["metadata"].get("Purpose_and_Scope") == extracted_text
+
+    def test_non_pdf_skips_extraction(self):
+        items = [self._make_drive_item("1", "report.docx")]
+        with patch("function_app._extract_purpose_and_scope") as mock_extract:
+            with patch("function_app._get_lookup_column_info", return_value=None):
+                with patch("function_app._fetch_item_fields", return_value={}):
+                    with patch("function_app.requests.get", return_value=_make_streamed_response()):
+                        blob_svc = MagicMock()
+                        _upload_drive_items(blob_svc, "container", "drive-1", "site-1", items, {}, "list-1", [])
+        mock_extract.assert_not_called()
 
 
 class TestBuildBlobMetadata:
@@ -774,6 +796,93 @@ class TestBuildBlobMetadata:
         warned_calls = [str(c) for c in mock_warn.call_args_list]
         assert any("HODSContentType" in c for c in warned_calls)
         assert "ContentType" not in result
+
+
+class TestFetchContent:
+    def test_returns_bytes_from_response(self):
+        response = _make_streamed_response(chunks=[b"hello", b" world"])
+        with patch("function_app.requests.get", return_value=response):
+            result = _fetch_content("http://example/file.pdf", {})
+        assert result == b"hello world"
+
+    def test_raises_on_http_error(self):
+        response = _make_streamed_response()
+        response.raise_for_status.side_effect = requests.exceptions.HTTPError("403")
+        with patch("function_app.requests.get", return_value=response):
+            with pytest.raises(requests.exceptions.HTTPError):
+                _fetch_content("http://example/file.pdf", {})
+
+
+def _make_pdf_reader_mock(page_texts, title=None):
+    """Build a minimal pypdf.PdfReader mock."""
+    pages = []
+    for text in page_texts:
+        page = MagicMock()
+        page.extract_text.return_value = text
+        pages.append(page)
+    reader = MagicMock()
+    reader.pages = pages
+    meta = {}
+    if title is not None:
+        meta["/Title"] = title
+    reader.metadata = meta
+    return reader
+
+
+class TestExtractPurposeAndScope:
+    def test_purpose_and_scope_heading_found(self):
+        reader = _make_pdf_reader_mock([
+            "1. Introduction\nSome intro.\n\n2. Purpose and Scope\nThis document defines the project scope.\n\n3. Background\nMore text."
+        ])
+        with patch("function_app.pypdf.PdfReader", return_value=reader):
+            result = _extract_purpose_and_scope(b"fake-pdf")
+        assert result is not None
+        assert "defines the project scope" in result
+
+    def test_purpose_only_heading_matched(self):
+        reader = _make_pdf_reader_mock([
+            "1. Purpose\nDefines the purpose of this standard.\n\n2. Next Section\nContent."
+        ])
+        with patch("function_app.pypdf.PdfReader", return_value=reader):
+            result = _extract_purpose_and_scope(b"fake-pdf")
+        assert result is not None
+        assert "Defines the purpose" in result
+
+    def test_scope_only_heading_matched(self):
+        reader = _make_pdf_reader_mock([
+            "Scope\nApplies to all HODS documents.\n\nBackground\nContent."
+        ])
+        with patch("function_app.pypdf.PdfReader", return_value=reader):
+            result = _extract_purpose_and_scope(b"fake-pdf")
+        assert result is not None
+        assert "Applies to all HODS" in result
+
+    def test_section_missing_falls_back_to_title(self):
+        reader = _make_pdf_reader_mock(["Unrelated content only."], title="HODS Guidelines v2")
+        with patch("function_app.pypdf.PdfReader", return_value=reader):
+            result = _extract_purpose_and_scope(b"fake-pdf")
+        assert result == "HODS Guidelines v2"
+
+    def test_section_missing_no_title_returns_none(self):
+        reader = _make_pdf_reader_mock(["Unrelated content."])
+        with patch("function_app.pypdf.PdfReader", return_value=reader):
+            result = _extract_purpose_and_scope(b"fake-pdf")
+        assert result is None
+
+    def test_pypdf_exception_returns_none(self):
+        with patch("function_app.pypdf.PdfReader", side_effect=Exception("corrupt PDF")):
+            result = _extract_purpose_and_scope(b"bad-bytes")
+        assert result is None
+
+    def test_searches_across_multiple_pages(self):
+        reader = _make_pdf_reader_mock([
+            "Cover page content.",
+            "2. Purpose and Scope\nDefined across page 2.\n\n3. Background",
+        ])
+        with patch("function_app.pypdf.PdfReader", return_value=reader):
+            result = _extract_purpose_and_scope(b"fake-pdf")
+        assert result is not None
+        assert "Defined across page 2" in result
 
 
 class TestDownloadAndUpload:
