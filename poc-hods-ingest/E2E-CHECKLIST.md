@@ -21,7 +21,10 @@ path tracked as ISSUE-7 in `docs/DEV-GUIDE-INGEST.md`.
       `RUNBOOK.md` for root causes if you hit one.
 - [ ] Confirm files land in the `ingest-output` (or configured) container
       with the expected `Modified` / `Prefix` / `ContentType` blob
-      metadata, and that a `last-sync` blob exists afterward.
+      metadata, and that PDF files also carry a `Purpose_and_Scope` metadata
+      field where a matching section was found.
+- [ ] Confirm a `hods-library-delta-state.json` blob exists in the container
+      after the run completes (this replaces the old `last-sync` blob).
 
 ## 2. Identity check (current architecture)
 
@@ -54,10 +57,9 @@ role-assignment query against the storage account's resource ID.
       against) a library with more changed files than the cap.
 - [ ] Confirm the run uploads exactly the capped number of files and stops.
 - [ ] Confirm the next run picks up the remaining files instead of skipping
-      them — this is the regression check for the last-sync-advancement
-      fix (see `_upload_changed_files` in `function_app.py`: last-sync only
-      advances to the earliest uploaded file's time when the cap is hit,
-      so leftover files stay eligible for the next run).
+      them — the delta-query model naturally handles this: the delta token
+      records only confirmed changes, so any items not uploaded remain
+      eligible on the next run.
 
 ## 4. Error handling
 
@@ -70,20 +72,24 @@ role-assignment query against the storage account's resource ID.
       | where severityLevel >= 3 and message has "Failed to sync"
       ```
 - [ ] Restore the correct value and confirm a subsequent run succeeds and
-      `last-sync` is unaffected by the failed run (it's never written on
-      failure — see `Ingest()` in `function_app.py`).
+      `hods-library-delta-state.json` is unaffected by the failed run (the
+      delta-state blob is never updated on failure — see `Ingest()` in
+      `function_app.py`).
 
-## 5. Memory / streaming validation
+## 5. Memory / PDF extraction validation
 
-- [ ] Upload a large (>50 MB) test file into the SharePoint library and
+- [ ] Upload a large (>50 MB) PDF test file into the SharePoint library and
       trigger a sync.
 - [ ] Watch the Function App's memory metric (Portal → Function App →
       Metrics, or Application Insights "Memory working set") during the
       run.
-- [ ] Confirm there's no memory spike proportional to the file size —
-      `_download_and_upload` streams the Graph download directly into the
-      blob upload in 4 MB chunks rather than buffering the whole file, so
-      memory use should stay roughly flat regardless of file size.
+- [ ] Confirm there's no memory spike disproportionate to file size — the
+      function buffers the file in memory to enable `pypdf` extraction, but
+      the buffer is bounded by file size, not unbounded. For very large PDFs,
+      watch for memory pressure and consider whether `INGEST_FILE_EXTENSIONS`
+      should exclude them if memory is a concern.
+- [ ] Confirm the uploaded blob's metadata includes a `Purpose_and_Scope`
+      key if the PDF has a matching section heading.
 
 ## 6. Idempotency (spot-check in a real environment)
 
@@ -93,4 +99,44 @@ SharePoint calls. As a real-tenant spot-check:
 
 - [ ] Trigger two runs back-to-back with no SharePoint changes in between.
 - [ ] Confirm the second run uploads 0 files (check
-      "Completed SharePoint sync. Files uploaded: 0" in the logs).
+      "Ingestion completed. Files uploaded: 0" in the logs).
+
+## 7. Historical load (`IngestHistorical` HTTP trigger)
+
+These checks validate the one-off backfill trigger. Retrieve the function key
+from: Function App → Functions → `IngestHistorical` → Function Keys.
+
+### 7.1 Basic call
+
+- [ ] POST to `/api/IngestHistorical?code=<key>` with no other parameters.
+- [ ] Confirm HTTP 200 response with JSON body `{"uploaded": N, "start_date": null, "end_date": null}`.
+- [ ] Confirm files appear in the `ingest-output` container with correct metadata.
+
+### 7.2 Date-range filter
+
+- [ ] POST to `/api/IngestHistorical?code=<key>&start_date=2024-01-01T00:00:00Z&end_date=2025-01-01T00:00:00Z`.
+- [ ] Confirm only files with `Modified` metadata within the specified range are uploaded.
+- [ ] Confirm the response body's `start_date` and `end_date` reflect the supplied values.
+
+### 7.3 Delta-state isolation
+
+- [ ] Note the current contents of `hods-library-delta-state.json` before the call
+      (download it or copy its content from the Portal's Storage Browser).
+- [ ] POST to `/api/IngestHistorical?code=<key>`.
+- [ ] Confirm `hods-library-delta-state.json` is **unchanged** after the historical
+      load completes — the blob's last-modified timestamp and content must be
+      identical to before the call.
+- [ ] Trigger the incremental timer (section 1) and confirm it picks up only files
+      changed since the last delta sync, not a full re-scan.
+
+### 7.4 `max_files` cap
+
+- [ ] POST to `/api/IngestHistorical?code=<key>&max_files=5`.
+- [ ] Confirm the response shows `"uploaded": 5` (or fewer if the library has
+      fewer than 5 matching files) and the run stops without error.
+
+### 7.5 Invalid parameters
+
+- [ ] POST with `start_date=not-a-date` — confirm HTTP 400 response with an
+      error message (not a 500 crash).
+- [ ] POST with `end_date` earlier than `start_date` — confirm HTTP 400 response.

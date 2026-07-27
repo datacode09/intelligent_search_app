@@ -17,10 +17,17 @@ document library into Azure Blob Storage on a timer.
 SharePoint document library  →  [Ingest Azure Function]  →  Azure Blob Storage
 ```
 
-The function wakes up on a timer (hourly by default), lists files in
-SharePoint changed since the last run, and uploads them to a blob
-container, tracking progress in a `last-sync` blob so re-runs only pick up
-new or changed files.
+The function runs in two modes:
+
+- **Incremental sync (timer trigger):** wakes up hourly, fetches only files
+  changed since the last run via a Microsoft Graph delta query, and uploads
+  them to a blob container. A delta-state JSON blob tracks progress so
+  re-runs only process new or changed files.
+- **Historical load (HTTP trigger):** a one-off `POST /api/IngestHistorical`
+  endpoint that scans the full SharePoint library (optionally filtered by
+  date range) and uploads matching files without touching the delta-state
+  blob, so historical backfills never interfere with the ongoing incremental
+  sync.
 
 ## CI/CD
 

@@ -464,15 +464,15 @@ Metadata is set at upload time via the `metadata=` argument on
 **For each file this pipeline uploads, blob metadata is written dynamically
 from every non-system column on the SharePoint document library** —
 no hardcoded column list, so new columns added to the site automatically
-show up as blob metadata on the next run without any code change
-(`function_app.py:378-388`).
+show up as blob metadata on the next run without any code change.
 
-Two always-present keys:
+Always-present keys:
 
 | Metadata key | Where it comes from |
 |---|---|
 | `Modified` | The file's `lastModifiedDateTime` from SharePoint/Graph — always written, required by the sync algorithm |
-| *(every other column)* | Every non-system field returned by the Microsoft Graph `sites/lists` endpoint for that list item |
+| *(every other non-system column)* | Every non-system field returned by the Microsoft Graph `sites/lists` endpoint for that list item |
+| `Purpose_and_Scope` | PDF files only — the text of the "Purpose and Scope" (or "Purpose", or "Scope") section, extracted from the first 5 pages by `pypdf`. Falls back to the PDF document title if no section heading is found. Absent if neither is available. |
 
 **System fields are automatically skipped** — SharePoint returns many
 internal fields alongside user-defined ones (`@odata.etag`,
@@ -509,18 +509,22 @@ A few behaviors worth knowing when you're checking the container by hand:
   a later run, it replaces the existing blob (same name) rather than
   creating a second copy.
 - **One extra control blob, not your data:** alongside your actual files,
-  the container also holds a blob literally named `last-sync` —
-  (`function_app.py:504-505`), a plain text timestamp the pipeline reads
-  on its next run to know where it left off. It's not one of your ingested
-  files; don't delete it unless you intend to force the next run to
-  re-scan everything from the beginning.
-- **Avoiding a massive first run:** since the very first run has no
-  `last-sync` blob to compare against, it defaults to ingesting everything
-  modified since 1970. Set the `INGEST_START_DATE` app setting (an
-  ISO-8601 timestamp) before that first run to skip anything older than a
-  chosen date — see `RUNBOOK.md` Appendix E for this and the manual
-  alternative (editing the `last-sync` blob directly) if you need to
-  adjust the starting point after the fact.
+  the container holds a blob named `hods-library-delta-state.json` (or
+  whatever `DELTA_STATE_BLOB_NAME` is set to). This JSON blob stores the
+  Microsoft Graph delta-query token that tracks which files have been seen.
+  It's not one of your ingested files; don't delete it unless you intend to
+  force the next run to re-seed from scratch (see `RUNBOOK.md` Appendix E).
+- **Two triggers, one container:** both the incremental timer trigger
+  (`Ingest`) and the historical HTTP trigger (`IngestHistorical`) write
+  files to the same container using the same blob-naming and metadata
+  conventions. `IngestHistorical` never touches the delta-state blob, so
+  historical loads are safe to run at any time without disrupting the
+  ongoing incremental sync.
+- **Avoiding a massive first run:** on the very first incremental run
+  (no delta-state blob yet), the function seeds from SharePoint list items
+  modified since `INGEST_START_DATE` (if set) or since deployment. Set this
+  app setting before deploying to control how far back the initial seed
+  goes — see `RUNBOOK.md` Appendix E for full detail.
 
 To inspect any of this yourself: Storage account → Containers →
 `ingest-output` → click a blob → **Properties** tab shows its metadata

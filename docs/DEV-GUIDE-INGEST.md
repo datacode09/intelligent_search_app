@@ -2,9 +2,14 @@
 
 ## Overview
 
-The ingest component is a Python Azure Function (timer trigger) that polls SharePoint via the Microsoft Graph API, downloads changed documents, and uploads them with metadata to Azure Blob Storage. The AI Search indexer then picks up blobs from the container automatically.
+The ingest component is a Python Azure Function app with two triggers:
 
-**Technology:** Python 3.13, Azure Functions v4, `azure-functions`, `azure-storage-blob`, `requests`
+- **`Ingest` (timer trigger):** wakes on a schedule (hourly by default), fetches files changed since the last run via a Microsoft Graph delta query, and uploads them with metadata to Azure Blob Storage. Progress is tracked in a delta-state JSON blob.
+- **`IngestHistorical` (HTTP trigger):** one-off `POST /api/IngestHistorical` endpoint for backfilling historical data. Scans the full SharePoint library (optionally filtered by date range) and uploads matching files without touching the delta-state blob.
+
+The AI Search indexer then picks up blobs from the container automatically.
+
+**Technology:** Python 3.13, Azure Functions v4, `azure-functions`, `azure-storage-blob`, `requests`, `pypdf>=4.0.0`
 
 ---
 
@@ -24,7 +29,7 @@ cd poc-hods-ingest
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-pip install pytest pytest-cov     # test dependencies (not in requirements.txt yet)
+pip install pytest pytest-cov     # test dependencies
 ```
 
 ### 3. Configure local settings
@@ -46,7 +51,10 @@ Copy `poc-hods-ingest/local.settings.json.example` to `poc-hods-ingest/local.set
     "SHAREPOINT_SITE_PATH": "/sites/<site-name>",
     "SHAREPOINT_LIBRARY_DRIVE_NAME": "Documents",
     "INGEST_SCHEDULE_CRON": "0 0 * * * *",
-    "INGEST_MAX_FILES_PER_RUN": "500"
+    "INGEST_MAX_FILES_PER_RUN": "100",
+    "INGEST_FILE_EXTENSIONS": ".pdf",
+    "DELTA_STATE_BLOB_NAME": "hods-library-delta-state.json",
+    "HISTORICAL_MAX_FILES": "5000"
   }
 }
 ```
@@ -79,16 +87,24 @@ curl -X POST http://localhost:7071/admin/functions/Ingest \
   -d '{}'
 ```
 
+To trigger the historical load locally (no auth key required when running locally):
+
+```bash
+# Full scan
+curl -X POST http://localhost:7071/api/IngestHistorical
+
+# Date-range filter
+curl -X POST "http://localhost:7071/api/IngestHistorical?start_date=2024-01-01T00:00:00Z&end_date=2025-01-01T00:00:00Z"
+```
+
 ### 6. Known issues
 
 | Issue | Status | File |
 |---|---|---|
 | ISSUE-1: timer fired every minute | Fixed — schedule now configurable via `INGEST_SCHEDULE_CRON`, defaults to hourly | `function_app.py` |
-| ISSUE-2: `max_files=5` hardcoded cap | Fixed — configurable via `INGEST_MAX_FILES_PER_RUN`, defaults to 500 | `function_app.py` |
-| ISSUE-3: last-sync advanced to now even on partial failure | Fixed — last-sync now advances only to the earliest modified time among successfully uploaded files | `function_app.py` |
-| ISSUE-7: connection string auth instead of Managed Identity | Open | `function_app.py` |
-
-See the remaining TODO comment in `function_app.py` for the ISSUE-7 fix snippet.
+| ISSUE-2: `max_files=5` hardcoded cap | Fixed — configurable via `INGEST_MAX_FILES_PER_RUN`, defaults to 100 | `function_app.py` |
+| ISSUE-3: last-sync advanced to now even on partial failure | Fixed — replaced by delta-query model; delta token only advances after a successful full-page fetch | `function_app.py` |
+| ISSUE-7: connection string auth instead of Managed Identity | Open — blob upload still uses `BLOB_STORAGE_CONNECTION_STRING`; see TODO comment in `function_app.py` for the Managed Identity snippet | `function_app.py` |
 
 ---
 
@@ -110,16 +126,37 @@ poc-hods-ingest/
 
 | Function | Purpose |
 |---|---|
-| `Ingest()` | Timer trigger entry point |
+| `Ingest()` | Timer trigger entry point — incremental delta-query sync |
+| `IngestHistorical()` | HTTP trigger entry point — one-off historical backfill |
 | `_get_graph_token()` | OAuth2 client-credentials → Graph API token |
 | `_resolve_site_id()` / `_get_site_id()` | Resolve the SharePoint site ID via Graph |
 | `_get_drive_id()` | Find the document library drive by name |
-| `_list_all_items()` | Breadth-first listing of all drive items (handles nested folders) |
-| `_upload_changed_files()` | Download + upload loop; returns count uploaded and earliest successfully-synced modified time |
+| `_get_drive_list_id()` | Resolve the SharePoint list ID for a drive (used for metadata lookups) |
+| `_list_all_items()` | Breadth-first listing of all drive items (legacy; used by `_upload_changed_files`) |
+| `_list_recent_files_from_hods_list()` | Query SP list items modified since a cutoff (used by `Ingest` on first run) |
+| `_list_all_files_from_hods_list()` | Full library scan with optional date-range filter (used by `IngestHistorical`) |
+| `_get_delta_changes()` | Fetch incremental changes from a Graph delta link |
+| `_initialize_delta_tracking_latest()` | Capture a fresh delta baseline after the initial seed |
+| `_read_delta_state()` | Read the stored delta token from blob storage |
+| `_save_delta_state()` | Persist the refreshed delta token to blob storage |
+| `_upload_drive_items()` | Download + upload loop for a list of drive items; calls `_build_blob_metadata` and `_extract_purpose_and_scope` |
+| `_upload_changed_files()` | Legacy download + upload loop (used by older tests; not called by `Ingest`) |
+| `_build_blob_metadata()` | Assemble the full blob metadata dict for a single file |
 | `_fetch_item_fields()` | Fetch SharePoint list-item fields (e.g. lookup columns) via Graph |
-| `_parse_last_sync()` | Parses the last-sync timestamp (ISO8601 or legacy format) |
-| `_to_blob_name()` | Sanitises filenames (strips paths, replaces spaces) |
-| `_to_blob_metadata_value()` | Encodes SharePoint LookupValue fields as ASCII strings |
+| `_fetch_content()` | Download file bytes into memory (enables PDF extraction before upload) |
+| `_extract_purpose_and_scope()` | Extract the "Purpose and Scope" section from PDF bytes via `pypdf`; falls back to PDF title |
+| `_get_lookup_column_info()` / `_get_lookup_item_display_value()` | Resolve lookup column values to human-readable text |
+| `_parse_last_sync()` | Parses a last-sync/modified timestamp (ISO8601 or legacy format) |
+| `_parse_historical_date_param()` | Safe ISO-8601 date parsing for HTTP query parameters |
+| `_to_blob_name()` | Sanitises filenames (strips paths, replaces special characters) |
+| `_to_blob_metadata_value()` | Encodes SharePoint field values (LookupValue dicts, lists, taxonomy) as ASCII strings |
+| `_trim_metadata()` | Enforces the 8 KB Azure blob metadata limit by dropping the longest values first |
+| `_is_system_field()` | Filters out internal SharePoint fields that should not be written as metadata |
+| `_sanitize_metadata_key()` | Replaces non-identifier characters in column names with `_` |
+| `_get_allowed_extensions()` | Reads `INGEST_FILE_EXTENSIONS` and returns the allowed set |
+| `_is_allowed_file_name()` | Checks whether a filename matches the allowed extension set |
+| `_ensure_container()` | Creates the blob container if it doesn't already exist |
+| `_retry()` | Retries a callable on transient errors with exponential back-off |
 
 ---
 
@@ -141,17 +178,37 @@ pytest tests/ -v --cov=function_app --cov-report=term-missing
 
 | Test class | Covers |
 |---|---|
-| `TestParseLastSync` | 6 cases: None, empty string, ISO8601-Z, ISO8601-offset, legacy format, bad input |
-| `TestToBlobName` | 4 cases: simple name, path stripping, space replacement, empty input |
-| `TestToBlobMetadataValue` | 5 cases: string, None, list of LookupValues, single dict, non-ASCII stripping |
-| `TestUploadChangedFiles` | 3 cases: an item failure propagates rather than silently returning a partial result, `max_files` caps uploads and reports the earliest successful modified time, default cap allows more than 5 files |
+| `TestParseLastSync` | None, empty string, ISO8601-Z, ISO8601-offset, legacy format, bad input |
+| `TestToBlobName` | Simple name, path stripping, space replacement, empty input |
+| `TestToBlobMetadataValue` | String, None, list of LookupValues, single dict, taxonomy dict, non-ASCII stripping |
+| `TestTrimMetadata` | Total size enforcement, always-keeps-Modified, drops longest first |
+| `TestSanitizeMetadataKey` | Space, hyphen, special character replacement |
+| `TestIsSystemField` | Known system fields excluded, user columns included |
+| `TestRetry` | Retries on transient errors, raises after max attempts, succeeds on first try |
+| `TestToUtcIso` | UTC and aware datetime formatting |
+| `TestGetAllowedExtensions` | Default `.pdf`, explicit list, `**` wildcard |
+| `TestIsAllowedFileName` | Extension matching, wildcard, case-insensitivity |
+| `TestReadDeltaState` | Missing blob returns None, existing blob returns token string |
+| `TestSaveDeltaState` | Writes correct JSON blob with expected fields |
+| `TestGetDeltaChanges` | Single page, multi-page pagination, delta link extraction |
+| `TestUploadDriveItems` | Upload count, metadata written, PDF extraction called, extension filtering |
+| `TestBuildBlobMetadata` | Prefix lookup resolution, HODSContentType mapping, Modified always present |
+| `TestFetchContent` | Successful download returns bytes, non-200 raises |
+| `TestExtractPurposeAndScope` | Heading found, heading not found returns None, multi-page, fallback to PDF title |
+| `TestDownloadAndUpload` | Streaming upload, retry on failure |
+| `TestUploadChangedFiles` | Item failure propagates, `max_files` cap, default cap |
+| `TestDynamicMetadataInUpload` | Non-system columns written dynamically |
+| `TestPrefixLookupFallback` | Fallback when lookup resolution fails |
+| `TestListAllFilesFromHodsList` | Full scan, date-range filter, extension filter, max_files cap |
+| `TestParseHistoricalDateParam` | Valid ISO-8601, invalid string, None input |
+| `TestIngestHistoricalEndpoint` | Success response shape, date params, max_files param, bad date returns 400 |
 
 ### What is NOT yet tested (gaps)
 
 - `_get_graph_token()` — requires mocking `requests.post` to a token endpoint
 - `_get_site_id()` / `_get_drive_id()` — requires mocking paginated Graph responses
-- Full blob upload round-trip via a real or fake `BlobServiceClient` (current tests mock it)
-- Incremental sync logic end-to-end (last-sync blob read/write round-trip against Azurite)
+- Full blob upload round-trip via a real `BlobServiceClient` (current tests mock it)
+- Delta-state end-to-end round-trip against Azurite (covered partially by `test_ingest_azurite_integration.py`)
 
 To add these, use `unittest.mock.patch` on `requests.post`/`requests.get` and `azure.storage.blob.BlobServiceClient`.
 

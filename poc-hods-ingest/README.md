@@ -11,29 +11,33 @@ Settings / Environment variables / App settings.
 | FUNCTIONS_WORKER_RUNTIME | python | No |
 | AzureWebJobsStorage | UseDevelopmentStorage=true when running locally | No; use the pre-defined value in Azure |
 | BLOB_STORAGE_CONNECTION_STRING | DefaultEndpointsProtocol=https;AccountName=<account-name>;AccountKey=<account-key>;EndpointSuffix=core.windows.net | Yes. Whether running locally or in Azure, replace <account-name> and <account-key>. |
-| BLOB_CONTAINER_NAME | Name of container where files should be written, e.g. ingest-output | Yes | 
+| BLOB_CONTAINER_NAME | Name of container where files should be written, e.g. ingest-output | Yes |
 | SHAREPOINT_TENANT_ID | Tenant id of the service principal used to connect to SharePoint | Yes |
 | SHAREPOINT_CLIENT_ID | Client id of the service principal used to connect to SharePoint | Yes |
 | SHAREPOINT_CLIENT_SECRET | Secret for the service principal used to connect to SharePoint | Yes |
-| SHAREPOINT_SITE_HOSTNAME | Hostname of the SharePoint site (e.g. contoso.sharepoint.com) | Yes | 
-| SHAREPOINT_SITE_PATH | /sites/YourSiteName | Yes | 
+| SHAREPOINT_SITE_HOSTNAME | Hostname of the SharePoint site (e.g. contoso.sharepoint.com) | Yes |
+| SHAREPOINT_SITE_PATH | /sites/YourSiteName | Yes |
+| SHAREPOINT_SITE_ID | Optional. Pre-resolved SharePoint site ID. If set, the `_get_site_id` Graph call is skipped on every run. Leave unset unless you have a specific reason to hard-code it. | No |
 | SHAREPOINT_LIBRARY_DRIVE_NAME | Documents | Yes |
-| SHAREPOINT_METADATA_COLUMN | Name of a single SharePoint column to copy as a metadata value on the blob | Yes | 
-| BLOB_METADATA_KEY | Name of the blob metadata key to hold the SharePoint column value. If not provided, the SHAREPOINT_METADATA_COLUMN name will be used | Yes |
 | INGEST_SCHEDULE_CRON | NCronTab expression for the timer trigger. Defaults to `0 0 * * * *` (top of every hour). Use a tighter value like `0 */2 * * * *` only for short local test runs — running every minute against real SharePoint will hit MS Graph throttling (HTTP 429). | Yes |
-| INGEST_MAX_FILES_PER_RUN | Max number of changed files uploaded in a single run. Defaults to 500. Lower this (e.g. 10) for a quick local smoke test. | Yes |
-| INGEST_METADATA_COLUMNS | Comma-separated list of SharePoint internal column names to include as blob metadata (e.g. Prefix,HODSContentType). When unset, all non-system columns are written. | No |
-| INGEST_START_DATE | ISO-8601 timestamp (e.g. 2024-01-01T00:00:00Z). Only used on the very first run, before a last-sync blob exists — sets the starting point so a fresh deployment doesn't ingest every file ever modified. Defaults to the Unix epoch (ingests everything) if unset. No effect once a last-sync blob exists. | No |
+| INGEST_MAX_FILES_PER_RUN | Max number of changed files processed in a single incremental run. Defaults to 100. Lower this (e.g. 10) for a quick local smoke test. | Yes |
+| INGEST_FILE_EXTENSIONS | Comma-separated file extensions to ingest, e.g. `.pdf,.docx`. Defaults to `.pdf`. Use `**` to ingest every file type regardless of extension. | No |
+| INGEST_METADATA_COLUMNS | Comma-separated list of SharePoint internal column names to include as blob metadata (e.g. `Prefix,HODSContentType`). When unset, all non-system columns are written. | No |
+| INGEST_START_DATE | ISO-8601 timestamp (e.g. `2024-01-01T00:00:00Z`). Only consulted on the very first run, before a delta-state blob exists — limits how far back the initial seed scan goes. Defaults to the current time if unset (ingests only files modified after deployment). Has no effect once a delta-state blob exists. | No |
+| DELTA_STATE_BLOB_NAME | Name of the blob used to persist the Microsoft Graph delta-query token for incremental sync. Defaults to `hods-library-delta-state.json`. Rarely needs changing unless multiple ingest configurations write to the same container. | No |
+| HISTORICAL_MAX_FILES | Maximum number of files processed by a single `IngestHistorical` HTTP call. Defaults to 5000. The per-request `max_files` query parameter takes precedence if supplied and is lower. | No |
 
 ## Description
 
-This Azure Function App pulls changed SharePoint files (using the lastModifiedDateTime) since the value contained in a blob named 'last-sync' in the Storage Account. Up to
-INGEST_MAX_FILES_PER_RUN files are then copied from SharePoint to the Storage Account and stored in BLOB_CONTAINER_NAME. The app then updates the last-sync blob with
-the modified time of the earliest file it successfully uploaded in that run (or the current time if every changed file was uploaded), so any files left over when the
-per-run cap is hit are picked up on the next run instead of being skipped.
-	
-Fill in the SharePoint app settings in local.settings.json and ensure your Entra app has Graph application permissions (typically Sites.Read.All, 
-or permissions set at a more restrictive level), then run the function host.
+This Azure Function App syncs SharePoint documents into Azure Blob Storage in two modes:
+
+**Incremental sync (timer trigger — `Ingest`):** wakes up on the `INGEST_SCHEDULE_CRON` schedule (hourly by default), fetches only files changed since the last run using a Microsoft Graph delta query, and uploads them to `BLOB_CONTAINER_NAME`. Progress is tracked in a JSON blob named `DELTA_STATE_BLOB_NAME` (`hods-library-delta-state.json` by default). On the very first run (no delta-state blob yet), the function seeds from recent SharePoint list items modified since `INGEST_START_DATE` (or since now if unset), then records a delta baseline so subsequent runs fetch only incremental changes. Up to `INGEST_MAX_FILES_PER_RUN` files are processed per run.
+
+**Historical load (HTTP trigger — `IngestHistorical`):** a one-off HTTP POST to `/api/IngestHistorical` (function-key auth required) that scans the full SharePoint library and uploads matching files. Optional query parameters `start_date` and `end_date` (ISO-8601) narrow the date range; `max_files` caps the result for that request. This trigger never writes to the delta-state blob, so historical loads never interfere with the ongoing incremental sync.
+
+For every file uploaded, blob metadata is populated dynamically from all non-system SharePoint columns. PDF files additionally have their "Purpose and Scope" section extracted (first 5 pages) and stored in the `Purpose_and_Scope` metadata field.
+
+Fill in the SharePoint app settings in `local.settings.json` and ensure your Entra app has Graph application permissions (typically `Sites.Read.All`, or a more restrictive site-scoped permission), then run the function host.
 
 ## Requirements
 

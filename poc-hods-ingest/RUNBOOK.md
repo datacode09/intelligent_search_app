@@ -215,7 +215,7 @@ action — it's not a bug, and clicking around more won't fix it.
 
 | Role | Lets you... | Needed for |
 |---|---|---|
-| **Reader** | View resources and their (non-secret) settings, but not change anything | Browsing the Portal, following section 11's checks |
+| **Reader** | View resources and their (non-secret) settings, but not change anything | Browsing the Portal, following section 12's checks |
 | **Contributor** | Create, edit, and delete most resources (Function Apps, storage accounts, etc.), but not manage who else has access | Deploying infra (8.7.1), changing Function App settings (8.2), redeploying code (8.3/8.7.2) |
 | **Key Vault Secrets User** | Read (and with some Key Vault configurations, also list) secret *values* inside a specific Key Vault | Viewing/copying an existing secret from Key Vault (4.7), or completing the Key Vault migration in 4.4 |
 | **Owner** | Everything Contributor can do, plus managing role assignments for other people | Granting *other* people access — you generally don't need this one yourself |
@@ -508,10 +508,11 @@ anything — its default settings are pre-configured to match Azurite.
 What success looks like:
 - Inside the emulator, find a container named `ingest-output`.
 - Inside that container, you should see one file for each file SharePoint
-  had that was new or changed, plus one extra file named `last-sync`.
-- `last-sync` is a small text file containing a timestamp — it's how the
-  program remembers what it already copied, so it doesn't re-copy the same
-  files every time it runs.
+  had that was new or changed, plus one extra blob named
+  `hods-library-delta-state.json`.
+- `hods-library-delta-state.json` is a small JSON file containing the
+  Microsoft Graph delta token — it's how the program remembers where it
+  left off, so it only fetches files that changed since the last run.
 
 ## 7. Desktop testing — Option B: real Azure cloud storage
 
@@ -562,9 +563,10 @@ Storage Explorer:
 
 1. Go to your storage account in the Portal.
 2. Click **Containers** in the left-hand menu, then click `ingest-output`.
-3. Confirm you see the uploaded files, and a `last-sync` file.
+3. Confirm you see the uploaded files, and a `hods-library-delta-state.json` blob.
 4. Click on one of the uploaded files, then look for "Metadata" — you
-   should see values for `Modified`, `Prefix`, and `ContentType`.
+   should see values for `Modified`, `Prefix`, `ContentType`, and
+   `Purpose_and_Scope` (if the file is a PDF with a matching section).
 
 ## 8. Cloud testing — running the real thing in Azure
 
@@ -667,7 +669,7 @@ Same idea as desktop testing, but everything's in the Portal now:
    way as step 7's instructions, but the account name will be the real
    one this Function App is configured to use).
 2. Click **Containers** → `ingest-output`.
-3. Confirm uploaded files and a `last-sync` file are present.
+3. Confirm uploaded files and a `hods-library-delta-state.json` blob are present.
 
 ### 8.6 Check the logs
 
@@ -776,11 +778,103 @@ settings in step 8.2.
 | Setting | Default | What it does |
 |---|---|---|
 | `INGEST_SCHEDULE_CRON` | `0 0 * * * *` (once an hour) | How often the timer fires. You can shorten this for a quick local test (e.g. every 2 minutes), but never use a short schedule against real SharePoint/production data — Microsoft Graph will start rejecting requests (see the `429` row in Troubleshooting) if you call it too often. |
-| `INGEST_MAX_FILES_PER_RUN` | `500` | The most files copied in one run. Lower this (e.g. to `10`) to do a quick test against a SharePoint library with lots of files, without waiting for everything to copy. |
+| `INGEST_MAX_FILES_PER_RUN` | `100` | The most files processed in one incremental run. Lower this (e.g. to `10`) to do a quick test against a SharePoint library with lots of files. |
+| `INGEST_FILE_EXTENSIONS` | `.pdf` | Comma-separated file extensions to ingest (e.g. `.pdf,.docx`). Use `**` to ingest every file type. |
 | `INGEST_METADATA_COLUMNS` | unset (all columns) | Comma-separated list of SharePoint internal column names to write as blob metadata (e.g. `Prefix,HODSContentType,MyColumn`). When unset, every non-system column returned by the library is written. When set, only the listed columns (plus the always-present `Modified`) are written — useful for keeping blob metadata small when the library has many columns you don't need. |
-| `INGEST_START_DATE` | unset (epoch — `1970-01-01`) | Only matters on the very first run, before any `last-sync` blob exists. Set this to an ISO-8601 timestamp (e.g. `2024-01-01T00:00:00Z`) to skip ingesting everything modified before that date. Without it, a brand-new deployment will try to pull every file ever modified in the source library on its first run. Has no effect once a `last-sync` blob already exists — see Appendix E for the manual alternative if you need to change the starting point after the fact. |
+| `INGEST_START_DATE` | unset (current time) | Only consulted on the very first run, before any delta-state blob exists. Set this to an ISO-8601 timestamp (e.g. `2024-01-01T00:00:00Z`) to seed from files modified on or after that date. Without it, the first run seeds only from files modified after the function starts. Has no effect once a delta-state blob already exists — see Appendix E for more detail. |
+| `DELTA_STATE_BLOB_NAME` | `hods-library-delta-state.json` | Name of the blob that stores the Microsoft Graph delta-query token between runs. Rarely needs changing; override it only if you run multiple ingest configurations writing to the same container. |
+| `HISTORICAL_MAX_FILES` | `5000` | Hard cap on files processed by a single `IngestHistorical` HTTP call. The per-request `max_files` query parameter can lower this further for an individual call. |
 
-## 10. Optional: running the deeper automated test
+## 10. Triggering a historical load
+
+The `IngestHistorical` HTTP trigger lets you backfill the SharePoint library
+in one call without disturbing the ongoing incremental sync. It is completely
+independent of the delta-state blob — it never reads or writes it.
+
+### 10.1 When to use it
+
+- **First deployment:** if you want to pre-populate the container with
+  documents older than the incremental sync's starting point (before
+  `INGEST_START_DATE` or before the function was first deployed).
+- **Ad-hoc re-sync:** if files were accidentally deleted from the container
+  and you want to restore them from SharePoint without waiting for them to
+  be picked up as "changes" by the timer trigger.
+- **Date-range slice:** to ingest only files from a specific period (e.g.
+  a particular quarter), without affecting the ongoing sync.
+
+### 10.2 Triggering the endpoint
+
+The endpoint requires a **function key** for authentication. Retrieve it
+from the Azure Portal: Function App → Functions → `IngestHistorical` →
+Function Keys → copy the `default` key.
+
+**Full library scan (no date filter):**
+
+```bash
+curl -X POST \
+  "https://<function-app-name>.azurewebsites.net/api/IngestHistorical?code=<function-key>"
+```
+
+**Date-range filter:**
+
+```bash
+curl -X POST \
+  "https://<function-app-name>.azurewebsites.net/api/IngestHistorical?code=<function-key>&start_date=2024-01-01T00:00:00Z&end_date=2025-01-01T00:00:00Z"
+```
+
+**Limit the number of files (useful for a quick spot-check):**
+
+```bash
+curl -X POST \
+  "https://<function-app-name>.azurewebsites.net/api/IngestHistorical?code=<function-key>&max_files=50"
+```
+
+**Query parameters (all optional):**
+
+| Parameter | Format | What it does |
+|---|---|---|
+| `start_date` | ISO-8601 (e.g. `2024-01-01T00:00:00Z`) | Only ingest files modified on or after this date. |
+| `end_date` | ISO-8601 | Only ingest files modified before this date. |
+| `max_files` | Integer | Cap for this specific call. Capped further by `HISTORICAL_MAX_FILES` (app setting). |
+
+**Locally (with the function host running):**
+
+```bash
+curl -X POST "http://localhost:7071/api/IngestHistorical"
+```
+
+No key is needed when running locally.
+
+### 10.3 Reading the response
+
+A successful call returns HTTP 200 with a JSON body:
+
+```json
+{
+  "uploaded": 42,
+  "start_date": "2024-01-01T00:00:00+00:00",
+  "end_date": "2025-01-01T00:00:00+00:00"
+}
+```
+
+- `uploaded`: number of files actually written to blob storage.
+- `start_date` / `end_date`: the effective date range used (null if no filter was applied).
+
+An error returns HTTP 400 (bad parameters), HTTP 500 (unhandled failure), or
+HTTP 503 (configuration missing). Check the Function App's Application Insights
+traces if the call succeeds but `uploaded` is unexpectedly 0.
+
+### 10.4 What it does NOT do
+
+- **Does not update the delta-state blob.** The incremental timer trigger's
+  state is completely unaffected — the next scheduled run will still pick up
+  only files changed since the last delta query.
+- **Does not deduplicate.** If a file was already uploaded by the incremental
+  sync, uploading it again via `IngestHistorical` overwrites the existing blob
+  (same key, `overwrite=True`). The file content will be identical, but the
+  blob metadata will be refreshed.
+
+## 11. Optional: running the deeper automated test (idempotency)
 
 There's one more automated test beyond the basic ones from step 5.7. It's
 optional, but it gives you extra confidence that re-running the program
@@ -804,7 +898,7 @@ pytest tests/test_ingest_azurite_integration.py -v
 If Node.js or `npx` isn't available, this test automatically skips itself
 instead of failing — so it's safe to ignore if it doesn't run.
 
-## 11. Someone else already set up the cloud infrastructure — how do you know it's actually correct?
+## 12. Someone else already set up the cloud infrastructure — how do you know it's actually correct?
 
 It's common to inherit an Azure setup someone (or some automated pipeline)
 already built, instead of building it yourself. "It's deployed" and "it's
@@ -818,7 +912,7 @@ case you're comfortable with one).
 Do these checks **in order** — each one tends to explain a failure in the
 next one, so working top to bottom is faster than jumping around.
 
-### 11.1 Do all the pieces exist?
+### 12.1 Do all the pieces exist?
 
 1. Go to [portal.azure.com](https://portal.azure.com) → **Resource
    groups** → open the resource group for this project.
@@ -829,7 +923,7 @@ next one, so working top to bottom is faster than jumping around.
    [8.7.1](#871-deploying-the-infrastructure-by-hand-only-needed-once-or-when-infrastructure-main-bicep-changes)
    and re-run the deployment.
 
-### 11.2 Is the Function App actually running?
+### 12.2 Is the Function App actually running?
 
 1. Click the **Function App** resource.
 2. On its **Overview** page, check the **Status** field — it should say
@@ -840,7 +934,7 @@ next one, so working top to bottom is faster than jumping around.
    but the code was never deployed — do
    [step 8.3](#83-deploy-the-code).
 
-### 11.3 Are the SharePoint settings actually filled in?
+### 12.3 Are the SharePoint settings actually filled in?
 
 1. On the Function App's page, click **Settings → Environment variables**.
 2. Look through the list for any value still showing `REPLACE_ME` — that's
@@ -848,7 +942,7 @@ next one, so working top to bottom is faster than jumping around.
    nobody completed [step 8.2](#82-fill-in-the-sharepoint-settings) yet.
    If you see it, fill those values in now before continuing.
 
-### 11.4 Is the Key Vault connection actually working (not just configured)?
+### 12.4 Is the Key Vault connection actually working (not just configured)?
 
 This is the check most people skip, and the most common way a setup
 *looks* fine but silently fails. Recall from
@@ -865,7 +959,7 @@ Function App was never given permission to read that Key Vault.
    warning icon / "Error" means the Function App can't read the secret —
    almost always because of a missing permission grant, which you'll
    check next.
-3. Click the **Key vault** resource (from section 11.1) → **Access
+3. Click the **Key vault** resource (from section 12.1) → **Access
    control (IAM)** → **Role assignments** tab.
 4. Look for a row where the **Role** is **Key Vault Secrets User** and
    the assigned identity is the Function App itself (it'll be listed by
@@ -881,7 +975,7 @@ Function App was never given permission to read that Key Vault.
 > ```
 > Look for `"status": "Resolved"` next to each setting in the output.
 
-### 11.5 Does the storage account look locked down?
+### 12.5 Does the storage account look locked down?
 
 1. Click the **Storage account** resource.
 2. Click **Settings → Configuration**. Confirm **Secure transfer
@@ -893,7 +987,7 @@ Function App was never given permission to read that Key Vault.
    **Public access level** is **Private** — files in this container
    should never be reachable by a plain public URL.
 
-### 11.6 Are logs actually flowing?
+### 12.6 Are logs actually flowing?
 
 A Function App can be "Running" with everything wired up and still have
 no working logging — which means when something does go wrong later,
@@ -901,7 +995,7 @@ you'll have no way to see why.
 
 1. On the Function App's page, click **Application Insights** in the
    left menu (or find the separate Application Insights resource from
-   section 11.1 directly).
+   section 12.1 directly).
 2. Click **Logs**, paste in `traces | take 10`, and click **Run**.
 3. If you see rows come back (even just routine startup messages), logs
    are flowing correctly. If the query returns nothing at all — even
@@ -909,7 +1003,7 @@ you'll have no way to see why.
    the Function App and Application Insights, and you should fix that
    before relying on logs to debug anything else.
 
-### 11.7 Optional, more advanced: has anyone changed things by hand since deployment?
+### 12.7 Optional, more advanced: has anyone changed things by hand since deployment?
 
 This check is for configuration drift (see the glossary in section 3) —
 it's useful but not required to confirm the basics above. It needs the
@@ -929,7 +1023,7 @@ changes, someone modified something in the Portal directly after the
 template was last deployed — worth knowing about, since the next template
 deployment would undo that manual change.
 
-### 11.8 The real proof: does it actually move files?
+### 12.8 The real proof: does it actually move files?
 
 Everything above confirms the *plumbing* is connected correctly — none of
 it proves the SharePoint-to-Blob logic actually works. For that, do
@@ -955,7 +1049,8 @@ often, slow down."
 | File upload fails with `AuthorizationFailure` or `AuthenticationFailed` | The storage connection string is wrong/expired, or the storage account is blocking your network/IP address | Re-copy the connection string from the Portal (step 7); check the storage account's "Networking" settings if you're on a restricted network |
 | `func start` says port 7071 is already in use | Some other program on your laptop is already using that port | Run `func start --port 7072` instead |
 | `ModuleNotFoundError` when running `func start` or `pytest` | Your virtual environment isn't activated, or you skipped `pip install -r requirements.txt` | Re-run the `source .venv/bin/activate` (or Windows equivalent) command from step 5.5, then re-run `pip install -r requirements.txt` |
-| The function runs but uploads 0 files, even though you know SharePoint has new files | The `last-sync` file already has a timestamp from a previous run that's newer than your test files | Delete the `last-sync` file from the storage container to force the program to copy everything again from scratch |
+| The function runs but uploads 0 files, even though you know SharePoint has new files | The delta-state blob exists and the Graph delta token shows no changes since the last run | Delete `hods-library-delta-state.json` from the container to force a re-seed on the next run (see Appendix E.2) |
+| The function logs a `410 Gone` Graph error | The stored delta token has expired (tokens expire after several days of inactivity) | Delete `hods-library-delta-state.json` to force a re-seed (see Appendix E.2) |
 
 ## Appendix A: SharePoint orientation and permissions
 
@@ -1094,11 +1189,11 @@ name.
 | Icon/name you'll see | What it is | Where it shows up in this guide |
 |---|---|---|
 | **Function App** | Runs this project's code | Steps 8.1–8.7 |
-| **Storage account** | Holds the uploaded files (and the Function App's own bookkeeping data) | Step 7, section 11.5 |
-| **Key Vault** | Stores secrets safely | Section 4.3–4.4, section 11.4 |
+| **Storage account** | Holds the uploaded files (and the Function App's own bookkeeping data) | Step 7, section 12.5 |
+| **Key Vault** | Stores secrets safely | Section 4.3–4.4, section 12.4 |
 | **App Service plan** | The underlying compute capacity the Function App runs on (you generally don't need to touch this directly) | Not directly referenced elsewhere in this guide |
 | **Application Insights** | Collects logs and telemetry from the Function App | Step 8.6 |
-| **Log Analytics workspace** | Stores the data Application Insights collects, queried with KQL | Step 8.6, section 11.6 |
+| **Log Analytics workspace** | Stores the data Application Insights collects, queried with KQL | Step 8.6, section 12.6 |
 
 ### B.4 Three separate permission systems — don't confuse them
 
@@ -1162,7 +1257,7 @@ platform team has already deployed all the resources and you're trying to
 audit or understand them, this is about what permissions the **resources
 themselves** — specifically the Function App's identity — need on *each
 other*, and how to actually find that in the Portal. This is the same
-ground section 11.4 checks for a specific symptom (a broken Key Vault
+ground section 12.4 checks for a specific symptom (a broken Key Vault
 reference); this appendix lays out the full picture component by
 component, and how to navigate to it from scratch.
 
@@ -1206,7 +1301,7 @@ matches what's expected:
 | Component | Needs permission on | Role | Why | Where to verify |
 |---|---|---|---|---|
 | Function App's managed identity | Key Vault | **Key Vault Secrets User** | To resolve the `@Microsoft.KeyVault(SecretUri=...)` references for `AzureWebJobsStorage` / `BLOB_STORAGE_CONNECTION_STRING` (section 4.3) | Key Vault → Access control (IAM) → Role assignments → look for the Function App's name (`infra/main.bicep:261-266`) |
-| Function App's managed identity | Storage account | **None — not RBAC-based** | This project authenticates to Blob Storage with an **account key** embedded in the connection string (`infra/main.bicep:83`), not a role-based login. So you will *not* find the Function App listed under the storage account's role assignments — that's expected, not a misconfiguration | N/A — if you're trying to verify storage access works, check the Key Vault reference status instead (section 11.4), since that's what actually gates whether the connection string is readable |
+| Function App's managed identity | Storage account | **None — not RBAC-based** | This project authenticates to Blob Storage with an **account key** embedded in the connection string (`infra/main.bicep:83`), not a role-based login. So you will *not* find the Function App listed under the storage account's role assignments — that's expected, not a misconfiguration | N/A — if you're trying to verify storage access works, check the Key Vault reference status instead (section 12.4), since that's what actually gates whether the connection string is readable |
 | Function App's managed identity | Microsoft Graph (SharePoint) | **Not Azure RBAC at all** | SharePoint access doesn't go through the Function App's managed identity — it uses the separate SharePoint service principal's (`SHAREPOINT_CLIENT_ID`) own Entra ID Graph application permission (Appendix B.4, item 2) | Entra ID → App registrations → the SharePoint app → API permissions |
 | You (a human operator) | Function App, resource group | **Reader** (to view) or **Contributor** (to change settings/redeploy) | Day-to-day operation (section 4.8) | Resource/resource group → Access control (IAM) → Check access |
 | You, if moving the SharePoint secret into Key Vault (section 4.4) | Key Vault | **Key Vault Secrets User** or **Key Vault Administrator** (to also create/manage secrets, not just read them) | Creating the `sharepoint-client-secret` entry | Key Vault → Access control (IAM) → Check access |
@@ -1217,7 +1312,7 @@ reading from Key Vault. Everything else (storage, SharePoint) uses a key
 or a separate credential instead of an Azure RBAC role. If you're
 auditing what the platform team set up, confirming that one role
 assignment exists (C.1, method 2) is the single most important check —
-it's also covered as a failure symptom in section 11.4.
+it's also covered as a failure symptom in section 12.4.
 
 ## Appendix D: A guided tour of the resource group
 
@@ -1249,7 +1344,7 @@ guide rather than repeating them.
 - **What to check:**
   - **Containers** (left menu → **Data storage → Containers**) — does
     `ingest-output` (or whatever `BLOB_CONTAINER_NAME` is set to) exist?
-  - Is it locked down correctly? See [section 11.5](#115-does-the-storage-account-look-locked-down)
+  - Is it locked down correctly? See [section 12.5](#125-does-the-storage-account-look-locked-down)
     for the exact settings to check (secure transfer, TLS version, public
     access level).
   - Remember: the Function App does **not** have an Azure RBAC role on
@@ -1274,7 +1369,7 @@ guide rather than repeating them.
     for exactly how to read this list.
   - If you want to confirm the *connection itself* works (not just that
     the role exists), do that check from the Function App side instead —
-    see [section 11.4](#114-is-the-key-vault-connection-actually-working-not-just-configured).
+    see [section 12.4](#124-is-the-key-vault-connection-actually-working-not-just-configured).
 
 ### D.3 Function App
 
@@ -1288,12 +1383,12 @@ guide rather than repeating them.
 - **What to check:**
   - **Settings → Environment variables → App settings** — are the
     SharePoint values filled in (not still `REPLACE_ME`)? See
-    [section 11.3](#113-are-the-sharepoint-settings-actually-filled-in).
+    [section 12.3](#123-are-the-sharepoint-settings-actually-filled-in).
   - **Identity** (left menu) → **System assigned** tab → is **Status**
     **On**? This is the managed identity that reads from Key Vault — see
     [Appendix C.1](#c1-how-to-navigate-to-a-resources-permissions-in-the-portal).
   - **Overview** → is it actually running, not stopped? See
-    [section 11.2](#112-is-the-function-app-actually-running).
+    [section 12.2](#122-is-the-function-app-actually-running).
 
 ### D.4 Application Insights
 
@@ -1306,7 +1401,7 @@ guide rather than repeating them.
   — that's just a shortcut into this same resource.)
 - **What to check:**
   - Are logs actually showing up? Run the `traces | take 10` query
-    described in [section 11.6](#116-are-logs-actually-flowing) to
+    described in [section 12.6](#126-are-logs-actually-flowing) to
     confirm data is flowing, not just that the resource exists.
 
 ### D.5 Log Analytics workspace
@@ -1339,66 +1434,68 @@ guide rather than repeating them.
 
 That's the full tour. If everything above checked out, the last remaining
 question is whether it actually *works* end to end — for that, there's no
-substitute for [section 11.8](#118-the-real-proof-does-it-actually-move-files)
+substitute for [section 12.8](#128-the-real-proof-does-it-actually-move-files)
 and the functional checklist in `E2E-CHECKLIST.md`.
 
-## Appendix E: Controlling where ingestion starts (avoiding a massive first run)
+## Appendix E: Controlling where ingestion starts and resetting incremental sync
 
-This pipeline tracks progress with a single timestamp, stored in a blob
-named `last-sync` in the output container (see step 6 / step 8.5). On
-every run, it asks SharePoint for files modified after that timestamp. If
-that blob doesn't exist yet (a brand-new deployment, or one you've reset),
-it has nothing to compare against — so by default it falls back to the
-Unix epoch (`1970-01-01`), meaning the very first run tries to pull
-*every* file ever modified in the source library. For a large library,
-that's a slow first run and a lot of unnecessary data movement.
+This pipeline tracks incremental sync progress using a **Microsoft Graph delta
+query token**, stored as a JSON blob (`hods-library-delta-state.json` by
+default, or whatever `DELTA_STATE_BLOB_NAME` is set to) in the output
+container. On every incremental run (`Ingest` timer trigger), the function
+reads this blob to fetch only the files that changed since the last token was
+recorded.
+
+If the delta-state blob doesn't exist yet (brand-new deployment, or one you've
+reset), the function performs an initial seed: it queries the SharePoint list
+for recently-modified items, uploads them, and then records a fresh delta
+baseline. How far back that initial seed goes is controlled by `INGEST_START_DATE`.
+
+**This is separate from the historical-load trigger** — `IngestHistorical` never
+reads or writes the delta-state blob at all. Use section 10 for ad-hoc
+historical loads; this appendix covers the incremental sync's starting point only.
 
 ### E.1 The configuration option — `INGEST_START_DATE`
 
 Set this app setting (see section 9's table) to an ISO-8601 timestamp,
-e.g. `2024-01-01T00:00:00Z`, and a fresh deployment's first run will only
-ingest files modified on or after that date, instead of everything since
-1970. This only matters before the first `last-sync` blob is written —
-once that blob exists, its value takes over completely and
-`INGEST_START_DATE` is no longer consulted (so it's safe to leave this
-setting in place indefinitely; it's a no-op after the first successful
-run).
+e.g. `2024-01-01T00:00:00Z`, and the first run's seed query will only
+include files modified on or after that date. Without it, the seed defaults
+to files modified since the function was deployed (the current time at first
+startup) — so a brand-new deployment with no `INGEST_START_DATE` will
+ingest only recent files, not everything ever in the library.
 
-This is the easiest option if you're setting things up for the first time
-and already know you don't care about anything older than a certain date.
+This setting has **no effect** once the delta-state blob exists — subsequent
+incremental runs use the stored Graph delta token instead and ignore
+`INGEST_START_DATE` entirely. It is safe to leave the setting in place; it
+becomes a no-op after the first successful run.
 
-### E.2 The manual alternative — seed the `last-sync` blob directly
+### E.2 Resetting the delta state to force a re-seed
 
-If you want to change the starting point *after* a `last-sync` blob
-already exists (e.g. you want to skip ahead, or force a re-ingest from a
-specific date without waiting for `INGEST_START_DATE` to matter), you can
-edit the value Azure is actually reading, with no app setting and no
-redeploy needed:
+If you want to force the incremental sync to re-run its initial seed (e.g.,
+the delta token has expired after a long gap, or you suspect the token is
+stale), delete the delta-state blob:
 
 1. Go to the storage account → **Containers** → `ingest-output`.
-2. Find the blob named `last-sync` (if it doesn't exist yet, this is the
-   same technique as a one-time manual seed before the first run, instead
-   of using `INGEST_START_DATE`).
-3. Click it → **Edit** (or upload a new blob with the same name,
-   overwriting it) → set its content to an ISO-8601 timestamp, e.g.
-   `2024-06-01T00:00:00Z`.
-4. Save. The next run will treat that value exactly as if it had been
-   written by a previous successful run — it'll only ingest files
-   modified after that date.
+2. Find the blob named `hods-library-delta-state.json` (or whatever
+   `DELTA_STATE_BLOB_NAME` is set to).
+3. Delete it.
+4. The next timer-trigger run will treat the situation as a first run,
+   re-seed from `INGEST_START_DATE` (or from now), and record a fresh
+   delta baseline.
 
-**To force a full re-ingest of everything again** (the opposite problem —
-see the Troubleshooting table's "uploads 0 files" row), delete the
-`last-sync` blob entirely rather than editing it; the next run falls back
-to `INGEST_START_DATE` if set, or the epoch otherwise.
+**Microsoft Graph delta tokens do expire** (typically after a few days of
+inactivity). If the incremental sync starts returning `410 Gone` errors, the
+token has expired — delete the blob as above to force a re-seed.
 
-### E.3 Which one should you use?
+### E.3 Which approach should you use?
 
 - **Setting up for the first time, know your cutoff date in advance:**
-  use `INGEST_START_DATE` — it's a one-time config change, no manual blob
-  editing.
-- **Already running, need to adjust after the fact:** edit the `last-sync`
-  blob directly (E.2) — `INGEST_START_DATE` won't help here since it's
-  ignored once `last-sync` exists.
-- **Testing, want a clean-slate re-ingest:** delete the `last-sync` blob
-  (covered in the Troubleshooting table) rather than editing either
-  setting.
+  set `INGEST_START_DATE` before the first run — it's a one-time config
+  change, no blob editing required.
+- **Need to backfill historical data (older than the seed window):**
+  use `IngestHistorical` (section 10) — it scans the full library without
+  disturbing the incremental sync state.
+- **Incremental sync stopped working (410 / expired token):**
+  delete the delta-state blob (E.2) to force a re-seed.
+- **Testing, want a clean-slate re-ingest:**
+  delete the delta-state blob and set (or clear) `INGEST_START_DATE`.
