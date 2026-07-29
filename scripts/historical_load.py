@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""
+Standalone historical SharePoint → Blob Storage load.
+
+No timeout ceiling: runs to completion regardless of duration, making it
+suitable for large backfills that would exceed the ~230-second HTTP response
+limit of the IngestHistorical Azure Function trigger.
+
+Reads the same env vars as the IngestHistorical function. CLI arguments
+override the env-var defaults for the three date/cap parameters.
+
+Usage:
+    python scripts/historical_load.py [--start-date DATE] [--end-date DATE] [--max-files N]
+
+    DATE format: ISO-8601, e.g. 2024-01-01T00:00:00Z
+
+Required env vars:
+    BLOB_STORAGE_CONNECTION_STRING
+    SHAREPOINT_TENANT_ID
+    SHAREPOINT_CLIENT_ID
+    SHAREPOINT_CLIENT_SECRET
+    SHAREPOINT_SITE_HOSTNAME
+    SHAREPOINT_SITE_PATH
+
+Optional env vars (same defaults as the function):
+    BLOB_CONTAINER_NAME          (default: ingest-output)
+    SHAREPOINT_LIBRARY_DRIVE_NAME (default: Documents)
+    SHAREPOINT_SITE_ID            (optional override — skips _get_site_id Graph call)
+    INGEST_FILE_EXTENSIONS        (default: .pdf)
+    HISTORICAL_MAX_FILES          (default: 5000)
+"""
+import argparse
+import datetime
+import json
+import logging
+import os
+import sys
+
+# Add poc-hods-ingest to the module search path so we can import directly
+# from function_app.py without duplicating any ingest logic here.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "poc-hods-ingest"))
+
+from azure.storage.blob import BlobServiceClient  # noqa: E402 (after sys.path mutation)
+from function_app import (  # noqa: E402
+    _ensure_container,
+    _get_allowed_extensions,
+    _get_drive_id,
+    _get_drive_list_id,
+    _get_graph_token,
+    _list_all_files_from_hods_list,
+    _resolve_site_id,
+    _upload_drive_items,
+)
+
+
+def _parse_date_arg(value: str, arg_name: str) -> datetime.datetime:
+    try:
+        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except ValueError:
+        print(f"error: --{arg_name}: cannot parse '{value}' as ISO-8601 date", file=sys.stderr)
+        sys.exit(1)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "One-off historical SharePoint → Blob Storage load with no timeout ceiling. "
+            "Never reads or modifies the delta-state blob used by the incremental timer trigger."
+        )
+    )
+    parser.add_argument(
+        "--start-date",
+        metavar="ISO8601",
+        help="Only ingest files modified on or after this date (e.g. 2024-01-01T00:00:00Z).",
+    )
+    parser.add_argument(
+        "--end-date",
+        metavar="ISO8601",
+        help="Only ingest files modified before this date.",
+    )
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        metavar="N",
+        help="Cap the number of files processed. Defaults to HISTORICAL_MAX_FILES env var (or 5000).",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%SZ",
+    )
+
+    start_date = _parse_date_arg(args.start_date, "start-date") if args.start_date else None
+    end_date = _parse_date_arg(args.end_date, "end-date") if args.end_date else None
+
+    blob_connection_string = os.getenv("BLOB_STORAGE_CONNECTION_STRING")
+    container_name = os.getenv("BLOB_CONTAINER_NAME", "ingest-output")
+    tenant_id = os.getenv("SHAREPOINT_TENANT_ID")
+    client_id = os.getenv("SHAREPOINT_CLIENT_ID")
+    client_secret = os.getenv("SHAREPOINT_CLIENT_SECRET")
+    site_hostname = os.getenv("SHAREPOINT_SITE_HOSTNAME")
+    site_path = os.getenv("SHAREPOINT_SITE_PATH")
+    site_id_override = os.getenv("SHAREPOINT_SITE_ID")
+    drive_name = os.getenv("SHAREPOINT_LIBRARY_DRIVE_NAME", "Documents")
+    allowed_extensions = _get_allowed_extensions()
+    max_files = args.max_files if args.max_files is not None else int(os.getenv("HISTORICAL_MAX_FILES", "5000"))
+
+    missing = [
+        name
+        for name, val in [
+            ("BLOB_STORAGE_CONNECTION_STRING", blob_connection_string),
+            ("SHAREPOINT_TENANT_ID", tenant_id),
+            ("SHAREPOINT_CLIENT_ID", client_id),
+            ("SHAREPOINT_CLIENT_SECRET", client_secret),
+            ("SHAREPOINT_SITE_HOSTNAME", site_hostname),
+            ("SHAREPOINT_SITE_PATH", site_path),
+        ]
+        if not val
+    ]
+    if missing:
+        print(f"error: missing required env vars: {', '.join(missing)}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(blob_connection_string)
+        _ensure_container(blob_service_client, container_name)
+
+        token = _get_graph_token(tenant_id, client_id, client_secret)
+        headers = {"Authorization": f"Bearer {token}"}
+        site_id = _resolve_site_id(site_hostname, site_path, headers, site_id_override)
+        drive_id = _get_drive_id(site_id, drive_name, headers)
+        list_id = _get_drive_list_id(drive_id, headers)
+
+        logging.info(
+            "Historical load: site=%s drive=%s list=%s start=%s end=%s max=%s extensions=%s",
+            site_id,
+            drive_id,
+            list_id,
+            start_date.isoformat() if start_date else "none",
+            end_date.isoformat() if end_date else "none",
+            max_files,
+            allowed_extensions,
+        )
+
+        items = _list_all_files_from_hods_list(
+            site_id,
+            list_id,
+            headers,
+            allowed_extensions,
+            start_date=start_date,
+            end_date=end_date,
+            max_files=max_files,
+        )
+        logging.info("Found %s files to upload", len(items))
+
+        uploaded_count = _upload_drive_items(
+            blob_service_client,
+            container_name,
+            drive_id,
+            site_id,
+            items,
+            headers,
+            list_id,
+            allowed_extensions,
+        )
+
+        result = {
+            "uploaded": uploaded_count,
+            "start_date": start_date.isoformat() if start_date else None,
+            "end_date": end_date.isoformat() if end_date else None,
+        }
+        logging.info("Historical load complete")
+        print(json.dumps(result))
+
+    except Exception as exc:
+        logging.exception("Historical load failed: %s", exc)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

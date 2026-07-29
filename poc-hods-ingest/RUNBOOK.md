@@ -874,6 +874,152 @@ traces if the call succeeds but `uploaded` is unexpectedly 0.
   (same key, `overwrite=True`). The file content will be identical, but the
   blob metadata will be refreshed.
 
+### 10.5 Running as a standalone script (no timeout ceiling)
+
+The `IngestHistorical` HTTP trigger has a practical ceiling: Azure caps HTTP
+response time at ~230 seconds regardless of App Service Plan tier. A full
+library backfill can take hours — far beyond that ceiling.
+
+`scripts/historical_load.py` wraps the same ingest logic in a standalone
+Python script with no timeout. It imports helpers directly from
+`poc-hods-ingest/function_app.py`, reads the same env vars, and accepts
+the same date/cap parameters as CLI arguments. It never touches the
+delta-state blob.
+
+**Install requirements first (once):**
+
+```bash
+pip install -r poc-hods-ingest/requirements.txt
+```
+
+#### Option A — run locally
+
+```bash
+# Export credentials (or put them in a .env file and source it)
+export BLOB_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net"
+export BLOB_CONTAINER_NAME="ingest-output"
+export SHAREPOINT_TENANT_ID="<tenant-id>"
+export SHAREPOINT_CLIENT_ID="<client-id>"
+export SHAREPOINT_CLIENT_SECRET="<client-secret>"
+export SHAREPOINT_SITE_HOSTNAME="<tenant>.sharepoint.com"
+export SHAREPOINT_SITE_PATH="/sites/<site-name>"
+export SHAREPOINT_LIBRARY_DRIVE_NAME="Documents"
+
+# Full library scan:
+python scripts/historical_load.py
+
+# Scoped to a date range:
+python scripts/historical_load.py --start-date 2020-01-01T00:00:00Z --end-date 2024-01-01T00:00:00Z
+
+# Quick smoke-test (cap at 10 files):
+python scripts/historical_load.py --max-files 10
+```
+
+On success the script exits 0 and prints a JSON summary:
+```json
+{"uploaded": 42, "start_date": "2020-01-01T00:00:00+00:00", "end_date": null}
+```
+On failure it exits 1 and logs the exception.
+
+#### Option B — Azure Cloud Shell (no local install, free)
+
+Cloud Shell is already authenticated to your subscription and has Python
+pre-installed. Open [shell.azure.com](https://shell.azure.com) and run:
+
+```bash
+git clone https://github.com/<org>/intelligent_search_app.git
+cd intelligent_search_app
+pip install -q -r poc-hods-ingest/requirements.txt
+
+# Set env vars (paste your values):
+export BLOB_STORAGE_CONNECTION_STRING="..."
+export SHAREPOINT_TENANT_ID="..."
+export SHAREPOINT_CLIENT_ID="..."
+export SHAREPOINT_CLIENT_SECRET="..."
+export SHAREPOINT_SITE_HOSTNAME="..."
+export SHAREPOINT_SITE_PATH="..."
+
+python scripts/historical_load.py --start-date 2020-01-01T00:00:00Z
+```
+
+The Cloud Shell session keeps running even if you close the browser tab (up to
+20 minutes of idle time). For a load that takes longer, prefer Option C.
+
+#### Option C — Azure Container Instance (unattended, pay per minute)
+
+Spins up a container, runs the load, and you delete it when done. Cost is
+roughly £0.03–0.05/hour for a single vCPU. The container exits automatically
+when the script finishes.
+
+**Step 1 — create the container:**
+
+```bash
+RESOURCE_GROUP="<your-rg>"
+CONTAINER_NAME="hods-historical-load"
+
+az container create \
+  --resource-group "$RESOURCE_GROUP" \
+  --name "$CONTAINER_NAME" \
+  --image python:3.13-slim \
+  --restart-policy Never \
+  --command-line "sh -c 'cd /app && pip install -q -r poc-hods-ingest/requirements.txt && python scripts/historical_load.py'" \
+  --environment-variables \
+    BLOB_STORAGE_CONNECTION_STRING="<connection-string>" \
+    BLOB_CONTAINER_NAME="ingest-output" \
+    SHAREPOINT_TENANT_ID="<tenant-id>" \
+    SHAREPOINT_CLIENT_ID="<client-id>" \
+    SHAREPOINT_CLIENT_SECRET="<client-secret>" \
+    SHAREPOINT_SITE_HOSTNAME="<tenant>.sharepoint.com" \
+    SHAREPOINT_SITE_PATH="/sites/<site-name>" \
+    SHAREPOINT_LIBRARY_DRIVE_NAME="Documents" \
+  --azure-file-volume-account-name "<storage-account-name>" \
+  --azure-file-volume-account-key "<storage-account-key>" \
+  --azure-file-volume-share-name "<file-share-name>" \
+  --azure-file-volume-mount-path /app
+```
+
+The `--azure-file-volume-*` flags mount your repo from an Azure Files share so
+the container can find `scripts/historical_load.py` and
+`poc-hods-ingest/function_app.py`. Alternatively, if you'd rather not set up an
+Azure Files share, replace the volume mount with an inline `git clone`:
+
+```bash
+  --command-line "sh -c 'apt-get install -qy git && git clone https://github.com/<org>/intelligent_search_app.git /app && cd /app && pip install -q -r poc-hods-ingest/requirements.txt && python scripts/historical_load.py'"
+```
+
+**Step 2 — follow the logs:**
+
+```bash
+az container logs \
+  --resource-group "$RESOURCE_GROUP" \
+  --name "$CONTAINER_NAME" \
+  --follow
+```
+
+**Step 3 — check the exit code after it finishes:**
+
+```bash
+az container show \
+  --resource-group "$RESOURCE_GROUP" \
+  --name "$CONTAINER_NAME" \
+  --query "containers[0].instanceView.currentState" \
+  --output table
+```
+
+`exitCode: 0` means success.
+
+**Step 4 — tear down:**
+
+```bash
+az container delete \
+  --resource-group "$RESOURCE_GROUP" \
+  --name "$CONTAINER_NAME" \
+  --yes
+```
+
+This stops billing immediately. The blobs already uploaded to storage are
+unaffected — only the compute container is deleted.
+
 ## 11. Optional: running the deeper automated test (idempotency)
 
 There's one more automated test beyond the basic ones from step 5.7. It's
