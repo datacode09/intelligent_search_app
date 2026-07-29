@@ -951,6 +951,31 @@ Spins up a container, runs the load, and you delete it when done. Cost is
 roughly £0.03–0.05/hour for a single vCPU. The container exits automatically
 when the script finishes.
 
+**Permissions you need:**
+
+| Action | Minimum role | Where to assign it |
+|---|---|---|
+| Create / start the container | **Contributor** on the resource group | Portal → Resource group → Access control (IAM) |
+| View logs and container state | **Reader** on the resource group (Contributor already includes this) | Same |
+| Delete the container | **Contributor** on the resource group | Same |
+| Mount an Azure Files share (if using `--azure-file-volume-*`) | **Storage Account Contributor** *or* **Reader and Data Access** on the storage account (needed to list the account key) | Portal → Storage account → Access control (IAM) |
+
+If you get a "AuthorizationFailed" error when running `az container create`,
+you are missing Contributor on the resource group. Ask whoever manages your
+Azure subscription to grant it — tell them the exact role name and resource
+group name so they can action it in one step.
+
+If you are using the `git clone` variant of the command instead of the Azure
+Files mount, the storage account permission above is not needed.
+
+To check your current role on a resource group:
+```bash
+az role assignment list \
+  --resource-group <your-rg> \
+  --assignee $(az account show --query user.name -o tsv) \
+  --output table
+```
+
 **Step 1 — create the container:**
 
 ```bash
