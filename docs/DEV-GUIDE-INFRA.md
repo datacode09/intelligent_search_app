@@ -37,7 +37,7 @@ The Bicep template deploys the following resources:
 | Azure OpenAI | S0 | `gpt-4o` + `text-embedding-3-large` deployments |
 | App Service Plan | P1v3 PremiumV3 Linux | Shared by Function App and API |
 | Autoscale setting | 1–3 instances | CPU >70% scale-out, <30% scale-in |
-| Function App | Python 3.13 | Timer trigger; Key Vault secret references |
+| Function App | Python 3.13 | Timer trigger (`Ingest`); HTTP trigger (`IngestHistorical`, POST `/api/IngestHistorical`); Key Vault secret references |
 | API App Service | Python 3.12 | System Assigned Managed Identity |
 | Static Web App | Standard | UI hosting |
 
