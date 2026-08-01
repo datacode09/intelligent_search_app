@@ -1100,10 +1100,10 @@ next one, so working top to bottom is faster than jumping around.
 2. On its **Overview** page, check the **Status** field — it should say
    `Running`. `Stopped` means nobody (or some cost-saving policy) turned
    it off.
-3. In the left-hand menu, click **Functions**. You should see one named
-   `Ingest` in the list. If the list is empty, the infrastructure exists
-   but the code was never deployed — do
-   [step 8.3](#83-deploy-the-code).
+3. In the left-hand menu, click **Functions**. You should see two functions
+   listed: `Ingest` (timer trigger) and `IngestHistorical` (HTTP trigger).
+   If the list is empty, the infrastructure exists but the code was never
+   deployed — do [step 8.3](#83-deploy-the-code).
 
 ### 12.3 Are the SharePoint settings actually filled in?
 

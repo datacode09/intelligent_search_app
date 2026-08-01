@@ -989,6 +989,13 @@ def IngestHistorical(req: func.HttpRequest) -> func.HttpResponse:
     start_date = _parse_historical_date_param(req.params.get("start_date"), "start_date")
     end_date = _parse_historical_date_param(req.params.get("end_date"), "end_date")
 
+    if start_date and end_date and end_date <= start_date:
+        return func.HttpResponse(
+            json.dumps({"error": "end_date must be after start_date"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
     if not blob_connection_string:
         return func.HttpResponse(
             json.dumps({"error": "Missing app setting: BLOB_STORAGE_CONNECTION_STRING"}),
@@ -1012,6 +1019,14 @@ def IngestHistorical(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     try:
+        # TODO [ISSUE-7 HIGH]: Uses a connection string (stored secret) instead of Managed Identity.
+        # The Function App already has a System-Assigned Managed Identity (assigned in main.bicep)
+        # and the Storage Blob Data Contributor role can be granted via Bicep.
+        #
+        # Fix — replace with:
+        #   from azure.identity import DefaultAzureCredential
+        #   storage_account_url = os.getenv("BLOB_STORAGE_ACCOUNT_URL")  # e.g. https://<account>.blob.core.windows.net
+        #   blob_service_client = BlobServiceClient(storage_account_url, DefaultAzureCredential())
         blob_service_client = BlobServiceClient.from_connection_string(blob_connection_string)
         _ensure_container(blob_service_client, container_name)
 
