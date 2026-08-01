@@ -458,8 +458,9 @@ from the file's bytes, viewable in the Portal under the blob's
 **Properties → Metadata** without downloading the file. It's meant for
 small descriptive tags (a few dozen short strings), not large data.
 Metadata is set at upload time via the `metadata=` argument on
-`upload_blob(...)` — this project's `_download_and_upload()` helper
-(`function_app.py:28-35`) does exactly that for every file it writes.
+`upload_blob(...)` — this project's `_upload_drive_items()` function calls
+`_fetch_content()` to download each file and then `blob_client.upload_blob(..., metadata=...)`
+to write the file with its full metadata in one step.
 
 **For each file this pipeline uploads, blob metadata is written dynamically
 from every non-system column on the SharePoint document library** —

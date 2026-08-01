@@ -316,8 +316,9 @@ test tenant) and have Entra ID admin access, here's the full path:
    **Team site**, and give it a name (e.g. `HODS Documents`). Note the site
    URL — you'll need its hostname and path below.
 3. Click **Documents** in the left navigation, then **+ Add column** to
-   add any metadata columns you want copied to blob metadata later (this
-   project supports copying one column via `SHAREPOINT_METADATA_COLUMN`).
+   add any metadata columns you want copied to blob metadata later (all
+   non-system columns are automatically written as blob metadata on each
+   upload — no configuration required).
 4. Upload a few test files into the library.
 
 **Register the Entra ID app (needs Entra ID admin rights):**
@@ -996,9 +997,8 @@ the exact internal **Name** field.
 
 A **column** is a piece of metadata attached to each file in a library
 (e.g. "Department," "Document Type") — visible as extra fields/headers in
-the library's list view. This program can copy the value of *one* column
-per file into the uploaded blob's metadata, via
-`SHAREPOINT_METADATA_COLUMN` (step 5.4 mentions adding one if you're
+the library's list view. All non-system columns are automatically written
+as blob metadata on each upload (step 5.4 mentions adding one if you're
 setting up a test site from scratch).
 
 ### A.2 SharePoint permission levels, and how to check your own
@@ -1043,7 +1043,7 @@ the SharePoint site itself:
 |---|---|
 | "Sorry, this site hasn't been shared with you" when opening the site URL | Your own account doesn't have at least Visitor access to the site — ask a site Owner to add you (this only affects you browsing the site in a browser, not the app, which uses its own Entra ID credentials) |
 | Library Settings shows a different "Name" than what's in the page title/breadcrumb | The library was renamed after creation — SharePoint keeps the original internal name in some contexts. Use the **Name** field from Library Settings for `SHAREPOINT_LIBRARY_DRIVE_NAME` |
-| A column you added doesn't show up in uploaded blob metadata | Double-check `SHAREPOINT_METADATA_COLUMN` matches the column's *internal* name, which can differ from its display name if you renamed it after creating it (hover the column header → column settings to check) |
+| A column you added doesn't show up in uploaded blob metadata | The column may have a display name that differs from its internal name (hover the column header → column settings to check). System fields are automatically excluded — any non-system column should appear automatically. |
 
 ## Appendix B: Azure Portal orientation and RBAC deep-dive
 

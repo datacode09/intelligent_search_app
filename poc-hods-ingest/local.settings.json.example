@@ -3,7 +3,7 @@
   "Values": {
     "FUNCTIONS_WORKER_RUNTIME": "python",
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
-    "BLOB_STORAGE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=<account-name>;AccountKey=<account-key>;EndpointSuffix=core.windows.net",
+    "BLOB_STORAGE_CONNECTION_STRING": "UseDevelopmentStorage=true",
     "BLOB_CONTAINER_NAME": "ingest-output",
     "SHAREPOINT_TENANT_ID": "",
     "SHAREPOINT_CLIENT_ID": "",
@@ -12,8 +12,9 @@
     "SHAREPOINT_SITE_PATH": "/sites/YourSiteName",
     "SHAREPOINT_LIBRARY_DRIVE_NAME": "Documents",
     "INGEST_SCHEDULE_CRON": "0 0 * * * *",
-    "INGEST_MAX_FILES_PER_RUN": "500",
+    "INGEST_MAX_FILES_PER_RUN": "100",
+    "INGEST_FILE_EXTENSIONS": ".pdf",
     "INGEST_START_DATE": "2024-01-01T00:00:00Z",
-    "INGEST_METADATA_COLUMNS": ""
+    "DELTA_STATE_BLOB_NAME": "hods-library-delta-state.json"
   }
 }
