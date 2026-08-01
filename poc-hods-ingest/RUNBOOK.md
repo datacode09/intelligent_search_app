@@ -1045,6 +1045,44 @@ az container delete \
 This stops billing immediately. The blobs already uploaded to storage are
 unaffected — only the compute container is deleted.
 
+#### SSL / certificate troubleshooting
+
+If the script fails with `SSLError: certificate verify failed`, your network is
+using an SSL-inspecting proxy or a private CA that isn't in the default trust store
+(common in corporate and government environments). Supply the CA bundle path — **do
+not disable verification**.
+
+**Option A (Local / Cloud Shell) — env var:**
+```bash
+export REQUESTS_CA_BUNDLE=/path/to/your-ca-bundle.crt
+python scripts/historical_load.py
+```
+
+**Option A (Local / Cloud Shell) — CLI argument:**
+```bash
+python scripts/historical_load.py --ca-bundle /path/to/your-ca-bundle.crt
+```
+
+**Option C (ACI) — pass as environment variable:**
+Add `REQUESTS_CA_BUNDLE="/certs/your-ca.crt"` to the `--environment-variables`
+block in the `az container create` command, and mount the certificate file via
+an Azure Files volume (same share as the repo) or add a download step in
+`--command-line`.
+
+Common CA bundle locations:
+
+| Environment | Path |
+|---|---|
+| Azure Cloud Shell | `/opt/microsoft/azcopy/ca-bundle.crt` or `python -c "import certifi; print(certifi.where())"` |
+| Ubuntu / Debian | `/etc/ssl/certs/ca-certificates.crt` |
+| RHEL / CentOS | `/etc/pki/tls/certs/ca-bundle.crt` |
+| macOS | `/etc/ssl/cert.pem` |
+| Windows (Git Bash) | `C:/Program Files/Git/usr/ssl/certs/ca-bundle.crt` |
+| Corporate proxy CA | Ask your IT / platform team for the `.crt` or `.pem` file |
+
+> **Never** set `PYTHONHTTPSVERIFY=0` or use `requests.get(verify=False)` — these
+> disable certificate verification entirely and must not be used in production.
+
 ## 11. Optional: running the deeper automated test (idempotency)
 
 There's one more automated test beyond the basic ones from step 5.7. It's

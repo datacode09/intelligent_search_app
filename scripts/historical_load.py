@@ -11,6 +11,7 @@ override the env-var defaults for the three date/cap parameters.
 
 Usage:
     python scripts/historical_load.py [--start-date DATE] [--end-date DATE] [--max-files N]
+                                      [--ca-bundle PATH]
 
     DATE format: ISO-8601, e.g. 2024-01-01T00:00:00Z
 
@@ -23,11 +24,42 @@ Required env vars:
     SHAREPOINT_SITE_PATH
 
 Optional env vars (same defaults as the function):
-    BLOB_CONTAINER_NAME          (default: ingest-output)
+    BLOB_CONTAINER_NAME           (default: ingest-output)
     SHAREPOINT_LIBRARY_DRIVE_NAME (default: Documents)
     SHAREPOINT_SITE_ID            (optional override — skips _get_site_id Graph call)
     INGEST_FILE_EXTENSIONS        (default: .pdf)
     HISTORICAL_MAX_FILES          (default: 5000)
+    REQUESTS_CA_BUNDLE            (path to a PEM CA bundle — see SSL section below)
+    CURL_CA_BUNDLE                (alternative env var for the same purpose)
+
+SSL / certificate issues:
+    If connections fail with "certificate verify failed", your network is likely
+    using an SSL-inspecting proxy or a private CA not in the default trust store
+    (common in corporate and government environments).
+
+    The correct fix is to supply the CA bundle file — never to disable verification.
+
+    Two ways to provide the CA bundle path:
+
+    1. Environment variable (apply it once for the whole session):
+           export REQUESTS_CA_BUNDLE=/path/to/your-ca-bundle.crt
+           python scripts/historical_load.py
+
+    2. CLI argument (overrides the env var for this run):
+           python scripts/historical_load.py --ca-bundle /path/to/your-ca-bundle.crt
+
+    Common locations for CA bundles:
+      - Azure Cloud Shell:   /opt/microsoft/azcopy/ca-bundle.crt
+                             or: python -c "import certifi; print(certifi.where())"
+      - Ubuntu/Debian:       /etc/ssl/certs/ca-certificates.crt
+      - RHEL/CentOS:         /etc/pki/tls/certs/ca-bundle.crt
+      - macOS (homebrew):    /etc/ssl/cert.pem
+      - Windows (Git Bash):  C:/Program Files/Git/usr/ssl/certs/ca-bundle.crt
+      - Corporate proxy CA:  ask your IT / platform team for the .crt or .pem file
+
+    DO NOT use PYTHONHTTPSVERIFY=0 or requests.get(verify=False) — those silently
+    disable certificate verification across the entire process and must never be
+    used in production or committed to source control.
 """
 import argparse
 import datetime
@@ -87,6 +119,15 @@ def main() -> None:
         metavar="N",
         help="Cap the number of files processed. Defaults to HISTORICAL_MAX_FILES env var (or 5000).",
     )
+    parser.add_argument(
+        "--ca-bundle",
+        metavar="PATH",
+        help=(
+            "Path to a PEM CA bundle file. Use when connections fail with "
+            "'certificate verify failed' (e.g. corporate SSL-inspection proxy). "
+            "Overrides REQUESTS_CA_BUNDLE env var. SSL verification is never disabled."
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -94,6 +135,12 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%SZ",
     )
+
+    ca_bundle = args.ca_bundle or os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("CURL_CA_BUNDLE")
+    if ca_bundle:
+        os.environ["REQUESTS_CA_BUNDLE"] = ca_bundle  # read by requests at call time
+        os.environ["SSL_CERT_FILE"] = ca_bundle        # read by some other HTTP libs
+        logging.info("Using CA bundle: %s", ca_bundle)
 
     start_date = _parse_date_arg(args.start_date, "start-date") if args.start_date else None
     end_date = _parse_date_arg(args.end_date, "end-date") if args.end_date else None
@@ -127,7 +174,10 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        blob_service_client = BlobServiceClient.from_connection_string(blob_connection_string)
+        blob_service_client = BlobServiceClient.from_connection_string(
+            blob_connection_string,
+            connection_verify=ca_bundle if ca_bundle else True,
+        )
         _ensure_container(blob_service_client, container_name)
 
         token = _get_graph_token(tenant_id, client_id, client_secret)
