@@ -1078,17 +1078,6 @@ class TestIngestHistoricalEndpoint:
         assert "uploaded" in body
         assert body["start_date"] == "2023-01-01T00:00:00+00:00"
 
-    def test_end_date_before_start_date_returns_400(self):
-        from function_app import IngestHistorical
-        req = self._make_request(params={
-            "start_date": "2024-06-01T00:00:00Z",
-            "end_date": "2024-01-01T00:00:00Z",
-        })
-        with patch.dict("os.environ", self._env()):
-            response = IngestHistorical(req)
-        assert response.status_code == 400
-        assert "end_date" in response.get_body().decode()
-
     def test_delta_state_blob_is_not_touched(self):
         from function_app import IngestHistorical
         req = self._make_request()

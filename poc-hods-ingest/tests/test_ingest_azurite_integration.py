@@ -1,6 +1,6 @@
 """Integration test against a real Azurite blob emulator.
 
-Exercises the real BlobServiceClient + delta-state read/write cycle end to
+Exercises the real BlobServiceClient + last-sync read/write cycle end to
 end; only the SharePoint/Graph-facing calls are mocked (no real tenant
 needed). Requires Node/npx to spin up Azurite — auto-skipped when
 unavailable so it never breaks CI (which only installs Python deps).
@@ -9,24 +9,22 @@ Run manually:
     pytest tests/test_ingest_azurite_integration.py -v
 """
 
-import json
+import datetime
 import shutil
 import socket
 import subprocess
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from azure.storage.blob import BlobServiceClient
 
-from function_app import _get_delta_changes, _read_delta_state, _save_delta_state
+from function_app import _parse_last_sync, _upload_changed_files
 
 AZURITE_ACCOUNT_NAME = "devstoreaccount1"
 AZURITE_ACCOUNT_KEY = (
     "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
 )
-
-DELTA_STATE_BLOB = "hods-library-delta-state.json"
 
 
 def _free_port():
@@ -84,98 +82,74 @@ def azurite_connection_string(tmp_path_factory):
         proc.wait(timeout=10)
 
 
-@pytest.fixture
-def container_client(azurite_connection_string):
-    blob_service_client = BlobServiceClient.from_connection_string(azurite_connection_string)
-    container_name = "ingest-output-delta-test"
-    cc = blob_service_client.get_container_client(container_name)
+def _make_item(item_id, name, modified):
+    return {"id": item_id, "name": name, "file": {}, "lastModifiedDateTime": modified}
+
+
+def _run_sync_cycle(blob_service_client, container_name, items):
+    """Mirrors the body of Ingest(): read last-sync, upload changed files,
+    advance last-sync to the earliest successfully uploaded file's modified
+    time (or now if everything succeeded)."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+
     try:
-        cc.delete_container()
+        last_sync_blob_client = blob_service_client.get_blob_client(container=container_name, blob="last-sync")
+        last_sync_raw = last_sync_blob_client.download_blob().readall().decode("utf-8")
+    except Exception:
+        last_sync_raw = None
+
+    last_sync = _parse_last_sync(last_sync_raw)
+
+    with patch("function_app._get_drive_list_id", return_value="list-1"), \
+         patch("function_app._get_lookup_column_info", return_value=None), \
+         patch("function_app._list_all_items", return_value=items), \
+         patch("function_app._fetch_item_fields", return_value={}), \
+         patch("function_app.requests.get") as mock_get:
+        response = mock_get.return_value
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        response.raise_for_status = lambda: None
+        response.iter_content.side_effect = lambda *a, **k: iter([b"file-bytes"])
+
+        uploaded, earliest_success = _upload_changed_files(
+            blob_service_client=blob_service_client,
+            container_name=container_name,
+            drive_id="drive-1",
+            site_id="site-1",
+            last_sync=last_sync,
+            headers={},
+        )
+
+    last_sync_time = (earliest_success or now_utc).isoformat()
+    config_blob_client = blob_service_client.get_blob_client(container=container_name, blob="last-sync")
+    config_blob_client.upload_blob(last_sync_time, overwrite=True)
+
+    return uploaded
+
+
+def test_idempotent_sync_three_runs(azurite_connection_string):
+    container_name = "ingest-output-test"
+    blob_service_client = BlobServiceClient.from_connection_string(azurite_connection_string)
+    container_client = blob_service_client.get_container_client(container_name)
+    try:
+        container_client.delete_container()
     except Exception:
         pass
-    cc.create_container()
-    yield cc
+    container_client.create_container()
 
-
-def test_save_and_read_delta_state_roundtrip(container_client):
-    token = "https://graph.microsoft.com/v1.0/sites/abc/delta?$deltaToken=xyz"
-    _save_delta_state(container_client, DELTA_STATE_BLOB, token)
-    retrieved = _read_delta_state(container_client, DELTA_STATE_BLOB)
-    assert retrieved == token
-
-
-def test_read_delta_state_returns_none_when_missing(container_client):
-    result = _read_delta_state(container_client, DELTA_STATE_BLOB)
-    assert result is None
-
-
-def test_overwrite_delta_state(container_client):
-    _save_delta_state(container_client, DELTA_STATE_BLOB, "delta-link-v1")
-    _save_delta_state(container_client, DELTA_STATE_BLOB, "delta-link-v2")
-    assert _read_delta_state(container_client, DELTA_STATE_BLOB) == "delta-link-v2"
-
-
-def test_get_delta_changes_single_page(container_client):
-    """_get_delta_changes should return items from a single-page Graph delta response."""
-    delta_items = [
-        {"id": "1", "name": "a.pdf", "file": {}, "lastModifiedDateTime": "2024-06-01T00:00:00Z"},
-        {"id": "2", "name": "b.pdf", "file": {}, "lastModifiedDateTime": "2024-06-02T00:00:00Z"},
+    items = [
+        _make_item("1", "a.pdf", "2024-06-01T00:00:00Z"),
+        _make_item("2", "b.pdf", "2024-06-02T00:00:00Z"),
+        _make_item("3", "c.pdf", "2024-06-03T00:00:00Z"),
     ]
-    next_delta_link = "https://graph.microsoft.com/v1.0/sites/abc/delta?$deltaToken=next"
-    delta_response = {
-        "value": delta_items,
-        "@odata.deltaLink": next_delta_link,
-    }
 
-    mock_response = MagicMock()
-    mock_response.raise_for_status = MagicMock()
-    mock_response.json.return_value = delta_response
+    uploaded_run_1 = _run_sync_cycle(blob_service_client, container_name, items)
+    uploaded_run_2 = _run_sync_cycle(blob_service_client, container_name, items)
+    uploaded_run_3 = _run_sync_cycle(blob_service_client, container_name, items)
 
-    with patch("function_app.requests.get", return_value=mock_response):
-        items, new_link = _get_delta_changes("https://graph.microsoft.com/v1.0/sites/abc/delta?$deltaToken=old", {})
+    assert uploaded_run_1 == len(items)
+    assert uploaded_run_2 == 0
+    assert uploaded_run_3 == 0
 
-    assert len(items) == 2
-    assert items[0]["name"] == "a.pdf"
-    assert items[1]["name"] == "b.pdf"
-    assert new_link == next_delta_link
-
-
-def test_get_delta_changes_multi_page(container_client):
-    """_get_delta_changes should follow @odata.nextLink pagination."""
-    page1 = {
-        "value": [{"id": "1", "name": "a.pdf", "file": {}}],
-        "@odata.nextLink": "https://graph.microsoft.com/v1.0/sites/abc/delta?$skipToken=page2",
-    }
-    page2 = {
-        "value": [{"id": "2", "name": "b.pdf", "file": {}}],
-        "@odata.deltaLink": "https://graph.microsoft.com/v1.0/sites/abc/delta?$deltaToken=final",
-    }
-
-    responses = [page1, page2]
-    call_count = [0]
-
-    def side_effect(url, headers, timeout=None):
-        mock = MagicMock()
-        mock.raise_for_status = MagicMock()
-        mock.json.return_value = responses[call_count[0]]
-        call_count[0] += 1
-        return mock
-
-    with patch("function_app.requests.get", side_effect=side_effect):
-        items, new_link = _get_delta_changes("https://graph.microsoft.com/v1.0/sites/abc/delta?$deltaToken=old", {})
-
-    assert len(items) == 2
-    assert new_link == "https://graph.microsoft.com/v1.0/sites/abc/delta?$deltaToken=final"
-
-
-def test_delta_state_persists_after_save(container_client):
-    """Verify delta state blob exists and contains valid JSON after save."""
-    token = "https://graph.microsoft.com/v1.0/sites/abc/delta?$deltaToken=persisted"
-    _save_delta_state(container_client, DELTA_STATE_BLOB, token)
-
-    blob_names = [b.name for b in container_client.list_blobs()]
-    assert DELTA_STATE_BLOB in blob_names
-
-    raw = container_client.get_blob_client(DELTA_STATE_BLOB).download_blob().readall().decode()
-    data = json.loads(raw)
-    assert data.get("delta_link") == token
+    blob_names = sorted(b.name for b in container_client.list_blobs())
+    assert blob_names == ["a.pdf", "b.pdf", "c.pdf", "last-sync"]
